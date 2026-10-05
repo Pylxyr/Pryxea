@@ -1,0 +1,470 @@
+<!doctype html>
+<html><head><meta charset="utf-8">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@600;700&family=IBM+Plex+Sans:wght@400;500;600&display=swap" rel="stylesheet">
+<style>
+  * { box-sizing: border-box; }
+  html, body { margin: 0; background: transparent; }
+  body {
+    font-family: "IBM Plex Sans", -apple-system, "Segoe UI", sans-serif;
+    color: #F3F1EA;
+    display: flex; align-items: flex-end; justify-content: flex-start;
+    height: 100vh; padding: 20px;
+  }
+  .panel {
+    width: 420px; padding: 14px 18px;
+    background: var(--panel-bg, rgba(15, 14, 20));
+    border-radius: 14px;
+    box-shadow: 0 8px 24px rgba(0,0,0,0.35);
+    --accent-primary: #9146FF;
+    --accent-secondary: #FF9D42;
+    transition: background 0.5s ease;
+    overflow: hidden;
+  }
+  .now { display: flex; gap: 12px; align-items: center; }
+  /* Track-change choreography: the finishing track exits left, the
+     incoming one enters by sliding up from below (see render()'s
+     trackKey-changed branch, which adds/removes these classes around a
+     single panel.innerHTML swap). Exit and enter share one duration
+     (0.4s, both transform and opacity) rather than mismatched ones —
+     with different durations, transitionend fires on whichever property
+     finishes first, so the swap could cut the slide-out a beat short of
+     actually finishing. Entrances get a livelier back-out overshoot
+     curve layered on top (see .now-enter-active below); exits use a
+     plainer accelerate, since overshooting on the way OUT reads as an
+     odd wobble rather than a confident pop into place. */
+  .now, .next {
+    transition: transform 0.4s cubic-bezier(.4,0,.2,1), opacity 0.4s cubic-bezier(.4,0,.2,1);
+  }
+  .now.now-exit { transform: translateX(-96px) scale(0.94); opacity: 0; }
+  .now.now-enter { transform: translateY(54px) scale(0.92); opacity: 0; }
+  .now.now-enter-active {
+    transform: translateY(0) scale(1); opacity: 1;
+    transition-timing-function: cubic-bezier(.34,1.56,.64,1);
+  }
+  .next.next-exit { transform: translateY(-28px) scale(0.97); opacity: 0; }
+  /* A brief pulse on the album art itself, timed with the pop-in above —
+     scoped to the compact 56px thumb rather than the whole row so the
+     glow's blur radius has room to breathe without hitting .panel's own
+     overflow:hidden edge (which would look like an abrupt clip rather
+     than a soft glow). Starts and ends at the thumb's own resting
+     ambient glow rather than nothing, so it reads as "the same glow,
+     just brighter for a moment" rather than a shadow popping in from
+     nowhere. Picks up whatever accent color the current thumbnail
+     extracted to (see applyPalette), so the flash always matches. */
+  .now.now-enter-active .thumb { animation: thumb-glow-pulse 900ms cubic-bezier(.22,.61,.36,1); }
+  @keyframes thumb-glow-pulse {
+    0%   { box-shadow: 0 0 0 1px rgba(255,255,255,0.10), 0 0 16px -4px var(--accent-primary); }
+    18%  { box-shadow: 0 0 0 1px rgba(255,255,255,0.28), 0 0 32px 5px var(--accent-primary); }
+    100% { box-shadow: 0 0 0 1px rgba(255,255,255,0.10), 0 0 16px -4px var(--accent-primary); }
+  }
+  .thumb {
+    width: 56px; height: 56px; border-radius: 10px; flex-shrink: 0;
+    background: rgba(255,255,255,0.08) center/cover no-repeat;
+    box-shadow: 0 0 0 1px rgba(255,255,255,0.10), 0 0 16px -4px var(--accent-primary);
+    transition: box-shadow 0.4s ease;
+  }
+  .info { min-width: 0; flex: 1; }
+  .title {
+    font-family: "Space Grotesk", -apple-system, "Segoe UI", sans-serif;
+    font-weight: 700; font-size: 15px; white-space: nowrap;
+    overflow: hidden; text-overflow: ellipsis;
+    transition: opacity 0.25s ease;
+  }
+  .meta { font-size: 12px; color: #9B9FB3; margin-top: 2px; }
+  .bar-row { display: flex; align-items: center; gap: 8px; margin-top: 8px; }
+  .time { font-size: 11px; color: #9B9FB3; width: 34px; flex-shrink: 0; }
+  .time.right { text-align: right; }
+  .bar { flex: 1; height: 4px; border-radius: 2px; background: rgba(255,255,255,0.12); overflow: hidden; }
+  /* Progress is a transform, not a width: it animates on the compositor, so a
+     one-second JS tick is all it takes to look smooth (a width change would
+     re-lay-out the panel on every frame of the transition). */
+  .fill {
+    height: 100%; width: 100%; background: var(--accent-secondary); border-radius: 2px;
+    transform: scaleX(0); transform-origin: left center;
+    transition: transform 1s linear, background 0.4s ease;
+  }
+  .idle { font-size: 13px; color: #9B9FB3; padding: 6px 2px; }
+  .next { margin-top: 10px; padding-top: 10px; border-top: 1px solid rgba(255,255,255,0.10); }
+  .next-label { font-size: 11px; color: #9B9FB3; margin-bottom: 4px; }
+  .next-item {
+    font-size: 12px; color: #C7C9D6; white-space: nowrap;
+    overflow: hidden; text-overflow: ellipsis; line-height: 1.6;
+    transition: transform 0.38s cubic-bezier(.34,1.56,.64,1), opacity 0.34s ease;
+  }
+  /* Applied only to an item that wasn't visible a moment ago — a newly
+     !sr'd track landing in the queue, or one promoted into view because
+     something ahead of it just left. Already-visible items are left
+     alone so they don't replay an entrance they already played. Each
+     gets a small extra transition-delay set in JS (animateNewQueueItems)
+     so multiple new items cascade in one after another instead of
+     popping up all at once. */
+  .next-item.item-enter { transform: translateY(30px) scale(0.95); opacity: 0; }
+  .next-item.item-enter-active { transform: translateY(0) scale(1); opacity: 1; }
+  @media (prefers-reduced-motion: reduce) {
+    .now, .next, .next-item, .thumb { animation: none !important; transition: none !important; }
+  }
+</style></head>
+<body><div class="panel" id="panel"></div>
+<script>
+const panel = document.getElementById('panel');
+let last = null, lastFetchedAt = 0, lastThumb = null, lastTrackKey = null, lastNextKey = null;
+
+function fmt(s) {
+  s = Math.max(0, Math.floor(s));
+  return Math.floor(s / 60) + ':' + String(s % 60).padStart(2, '0');
+}
+
+const DEFAULT_PRIMARY = [145, 70, 255];    // #9146FF
+const DEFAULT_SECONDARY = [255, 157, 66];  // #FF9D42
+const PANEL_BASE = [15, 14, 20];           // matches .panel's default rgba(15,14,20,...) base
+
+function rgbStr(c) { return `rgb(${c[0]},${c[1]},${c[2]})`; }
+function rgbaStr(c, a) { return `rgba(${c[0]},${c[1]},${c[2]},${a})`; }
+
+function mix(base, accent, amount) {
+  return base.map((v, i) => Math.round(v * (1 - amount) + accent[i] * amount));
+}
+
+// Boost toward legible against the dark panel — raw thumbnail colors skew muddy.
+function legibilize(c) {
+  const max = Math.max(c[0], c[1], c[2]) || 1;
+  const boost = 255 / max * 0.75;
+  return c.map((v) => Math.min(255, Math.round(v * boost + 40)));
+}
+
+function rgbToHsl([r, g, b]) {
+  r /= 255; g /= 255; b /= 255;
+  const max = Math.max(r, g, b), min = Math.min(r, g, b), d = max - min;
+  const l = (max + min) / 2;
+  if (d === 0) return [0, 0, l];
+  const s = d / (1 - Math.abs(2 * l - 1));
+  let h;
+  if (max === r) h = ((g - b) / d) % 6;
+  else if (max === g) h = (b - r) / d + 2;
+  else h = (r - g) / d + 4;
+  h *= 60;
+  if (h < 0) h += 360;
+  return [h, s, l];
+}
+
+function hslToRgb([h, s, l]) {
+  const c = (1 - Math.abs(2 * l - 1)) * s;
+  const x = c * (1 - Math.abs((h / 60) % 2 - 1));
+  const m = l - c / 2;
+  let rgb;
+  if (h < 60) rgb = [c, x, 0];
+  else if (h < 120) rgb = [x, c, 0];
+  else if (h < 180) rgb = [0, c, x];
+  else if (h < 240) rgb = [0, x, c];
+  else if (h < 300) rgb = [x, 0, c];
+  else rgb = [c, 0, x];
+  return rgb.map((v) => Math.round((v + m) * 255));
+}
+
+function hueOf(c) { return rgbToHsl(c)[0]; }
+
+// Used when the artwork doesn't hand us a second color distinct enough from
+// the primary (near-monochrome art) — guarantees the two accents are never
+// near-identical, which is the whole point of having two.
+function rotateHue(c, deg) {
+  const [h, s, l] = rgbToHsl(c);
+  return hslToRgb([(h + deg) % 360, Math.max(s, 0.55), Math.min(0.62, Math.max(l, 0.45))]);
+}
+
+function applyPalette(url) {
+  if (!url) {
+    panel.style.setProperty('--accent-primary', rgbStr(DEFAULT_PRIMARY));
+    panel.style.setProperty('--accent-secondary', rgbStr(DEFAULT_SECONDARY));
+    panel.style.removeProperty('--panel-bg');
+    return;
+  }
+  const img = new Image();
+  img.crossOrigin = 'anonymous';
+  img.onload = () => {
+    try {
+      const size = 32;
+      const c = document.createElement('canvas');
+      c.width = size; c.height = size;
+      const ctx = c.getContext('2d');
+      ctx.drawImage(img, 0, 0, size, size);
+      const px = ctx.getImageData(0, 0, size, size).data;
+
+      // Coarse RGB histogram (32-wide buckets: 8x8x8 = 512 cells) to find
+      // the dominant color, skipping near-white/near-black/near-gray
+      // pixels so a plain border or letterboxing in the artwork doesn't
+      // win the "dominant color" slot just by being the most common pixel.
+      const buckets = new Map();
+      for (let i = 0; i < px.length; i += 4) {
+        const r = px[i], g = px[i + 1], b = px[i + 2];
+        const max = Math.max(r, g, b), min = Math.min(r, g, b);
+        if (max - min < 18) continue;
+        if (max > 245 && min > 225) continue;
+        if (max < 20) continue;
+        const key = (r >> 5) + ',' + (g >> 5) + ',' + (b >> 5);
+        const entry = buckets.get(key);
+        if (entry) { entry.count++; entry.r += r; entry.g += g; entry.b += b; }
+        else buckets.set(key, { count: 1, r, g, b });
+      }
+      const ranked = [...buckets.values()].sort((a, b2) => b2.count - a.count);
+      const toColor = (e) => [Math.round(e.r / e.count), Math.round(e.g / e.count), Math.round(e.b / e.count)];
+
+      let primary, secondary;
+      if (ranked.length === 0) {
+        primary = DEFAULT_PRIMARY;
+        secondary = DEFAULT_SECONDARY;
+      } else {
+        primary = toColor(ranked[0]);
+        const primaryHue = hueOf(primary);
+        // First runner-up bucket at least ~45deg of hue away — a genuinely
+        // distinct color, not just a lighter/darker shade of the primary.
+        const distinct = ranked.slice(1).find((e) => {
+          const h = hueOf(toColor(e));
+          const diff = Math.min(Math.abs(h - primaryHue), 360 - Math.abs(h - primaryHue));
+          return diff > 45;
+        });
+        secondary = distinct ? toColor(distinct) : rotateHue(primary, 150);
+      }
+
+      primary = legibilize(primary);
+      secondary = legibilize(secondary);
+      panel.style.setProperty('--accent-primary', rgbStr(primary));
+      panel.style.setProperty('--accent-secondary', rgbStr(secondary));
+      panel.style.setProperty('--panel-bg', rgbaStr(mix(PANEL_BASE, primary, 0.30), 1.0));
+    } catch (e) {
+      // Canvas error (shouldn't happen via the same-origin /thumb-proxy —
+      // see the proxy fetch below — but keep the current accents either way).
+    }
+  };
+  img.onerror = () => {};
+  // Routed through our own /thumb-proxy, not the raw thumbnail_url: YouTube's
+  // CDN doesn't send Access-Control-Allow-Origin, so a direct cross-origin
+  // load here taints the canvas and getImageData() throws — silently
+  // no-op'ing this whole feature. The *visible* <div class="thumb"> below
+  // still loads thumbnail_url directly (display doesn't need CORS at all).
+  img.src = '/thumb-proxy?url=' + encodeURIComponent(url);
+}
+
+function nextHtml(queue) {
+  const items = (queue || []).slice(0, 2);
+  if (items.length === 0) return '';
+  return '<div class="next-label">Up next</div>'
+    + items.map(q => `<div class="next-item">${escapeHtml(q.title)}</div>`).join('');
+}
+
+// Marks the incoming queue items that weren't on screen a moment ago with
+// item-enter, then flips to item-enter-active next frame so the
+// slide-up-from-bottom transition actually has a starting point to
+// animate from. oldTitles is the previous render's up-next titles (in
+// order) — an item already showing, just shifted up a slot because
+// something ahead of it left, is deliberately NOT re-animated.
+function animateNewQueueItems(wrap, newTitles, oldTitles) {
+  const items = wrap.querySelectorAll('.next-item');
+  items.forEach((el, i) => {
+    if (newTitles[i] !== undefined && !oldTitles.includes(newTitles[i])) {
+      // Staggered by position, not by how many items are actually new —
+      // so if item 2 is new but item 1 isn't, item 2 still waits its
+      // turn rather than jumping in first. Each fresh render creates
+      // brand-new elements (see innerHTML above), so there's no stale
+      // delay to worry about clearing between renders.
+      el.style.transitionDelay = (i * 70) + 'ms';
+      el.classList.add('item-enter');
+    }
+  });
+  requestAnimationFrame(() => {
+    wrap.querySelectorAll('.next-item.item-enter').forEach((el) => {
+      el.classList.remove('item-enter');
+      el.classList.add('item-enter-active');
+    });
+  });
+}
+
+let lastPct = 0;
+
+function render(data, elapsed) {
+  if (!data.playing) {
+    if (lastTrackKey !== null) {
+      panel.innerHTML = '<div class="idle">Radio\'s quiet right now</div>';
+      lastTrackKey = null;
+      lastThumb = null;
+      lastNextKey = null;
+    }
+    return;
+  }
+
+  const trackKey = data.webpage_url || data.title;
+  const newTitles = (data.queue || []).slice(0, 2).map(q => q.title);
+  const nextKey = JSON.stringify(newTitles);
+
+  if (trackKey !== lastTrackKey) {
+    const oldTitles = JSON.parse(lastNextKey || '[]');
+    const oldNow = document.getElementById('now-block');
+    lastTrackKey = trackKey;
+    lastNextKey = nextKey;
+    if (data.thumbnail_url !== lastThumb) {
+      lastThumb = data.thumbnail_url;
+      applyPalette(data.thumbnail_url);
+    }
+    // escapeHtml() here too (not just on title/uploader/requester below): this
+    // value lands inside an HTML attribute (style="...url('...')"), where an
+    // unescaped quote can break out and inject markup — !sr accepts arbitrary
+    // URLs from chat, so thumbnail_url isn't trustworthy input.
+    const thumb = data.thumbnail_url ? `style="background-image:url('${escapeHtml(data.thumbnail_url)}')"` : '';
+    const hasNext = (data.queue || []).length > 0;
+    const buildNewPanel = () => {
+      panel.innerHTML = `
+        <div class="now now-enter" id="now-block">
+          <div class="thumb" ${thumb}></div>
+          <div class="info">
+            <div class="title" id="t-title" style="opacity:0">${escapeHtml(data.title)}</div>
+            <div class="meta">requested by ${escapeHtml(data.requester_name)}</div>
+            <div class="bar-row">
+              <span class="time" id="t-elapsed">0:00</span>
+              <div class="bar"><div class="fill" id="t-fill"></div></div>
+              <span class="time right">${fmt(data.duration_seconds)}</span>
+            </div>
+          </div>
+        </div>
+        <div class="next" id="next-wrap" style="${hasNext ? '' : 'display:none'}">${nextHtml(data.queue)}</div>
+      `;
+      const now = document.getElementById('now-block');
+      const wrap = document.getElementById('next-wrap');
+      // Rebuilt fresh above with the *-enter classes (translateY + opacity:0)
+      // — flip to the active state next frame so there's a starting point
+      // for the transition to animate from, same trick the title's own
+      // opacity fade already used.
+      requestAnimationFrame(() => {
+        const t = document.getElementById('t-title');
+        if (t) t.style.opacity = '1';
+        if (now) {
+          now.classList.remove('now-enter');
+          now.classList.add('now-enter-active');
+        }
+      });
+      // Every item in a freshly-rebuilt queue slides up together as part
+      // of the same transition — "oldTitles" here is deliberately the
+      // pre-track-change queue, so nothing in the new list is treated as
+      // "already visible", and the whole up-next block reads as moving up
+      // in lockstep with the promoted track above it.
+      if (wrap) animateNewQueueItems(wrap, newTitles, oldTitles);
+    };
+
+    if (oldNow) {
+      // A track was already showing — animate it out (left) before
+      // swapping in the new one, rather than a hard cut. The old
+      // next-wrap exits upward in the same beat, so the whole panel
+      // reads as one coordinated shift rather than two unrelated pieces
+      // changing independently.
+      let swapped = false;
+      const swap = () => { if (!swapped) { swapped = true; buildNewPanel(); } };
+      oldNow.classList.add('now-exit');
+      const oldWrap = document.getElementById('next-wrap');
+      if (oldWrap) oldWrap.classList.add('next-exit');
+      oldNow.addEventListener('transitionend', swap, { once: true });
+      // Safety net: prefers-reduced-motion (or any environment where the
+      // transition genuinely never fires) would otherwise wait forever.
+      // Comfortably past the 400ms exit transition above, not equal to
+      // it — right at the boundary this could occasionally race ahead of
+      // the real transitionend on a slow frame, which the `swapped` flag
+      // makes harmless either way, but there's no reason to cut it close.
+      setTimeout(swap, 550);
+    } else {
+      // First render, or coming back from silence — nothing on screen to
+      // animate away from, so just build directly.
+      buildNewPanel();
+    }
+  } else if (nextKey !== lastNextKey) {
+    // Same track still playing, but the queue itself changed (a new !sr
+    // landed, or a mod cleared/blocked something) — update just the "Up
+    // next" list in place. Without this branch, a queue change while
+    // nothing else changed was silently dropped: the block above is the
+    // *only* thing that ever touched panel.innerHTML, and it's gated on
+    // the now-playing track changing, not the queue — so "Up next" only
+    // ever caught up whenever a new song happened to start next, which
+    // looked like it needed an OBS browser-source refresh to show up.
+    const oldTitles = JSON.parse(lastNextKey || '[]');
+    lastNextKey = nextKey;
+    const wrap = document.getElementById('next-wrap');
+    if (wrap) {
+      const hasNext = (data.queue || []).length > 0;
+      wrap.style.display = hasNext ? '' : 'none';
+      wrap.innerHTML = nextHtml(data.queue);
+      // Only a genuinely new arrival slides up from the bottom — a track
+      // that was already visible and just moved up a slot is left as-is.
+      animateNewQueueItems(wrap, newTitles, oldTitles);
+    }
+  }
+
+  // Runs once a second via refresh() — only touches the two changing nodes,
+  // not a full innerHTML rebuild (which would undo the animations above).
+  const pct = data.duration_seconds > 0 ? Math.min(100, (elapsed / data.duration_seconds) * 100) : 0;
+  const fillEl = document.getElementById('t-fill');
+  const elapsedEl = document.getElementById('t-elapsed');
+  if (fillEl) {
+    // A new track starts again from zero: jump there rather than sweeping back.
+    fillEl.style.transition = pct < lastPct ? 'none' : '';
+    fillEl.style.transform = `scaleX(${(pct / 100).toFixed(4)})`;
+    lastPct = pct;
+  }
+  const elapsedText = fmt(elapsed);
+  if (elapsedEl && elapsedEl.textContent !== elapsedText) elapsedEl.textContent = elapsedText;
+}
+
+function escapeHtml(s) {
+  // Not the textContent/innerHTML round-trip trick — that leaves quotes
+  // unescaped, which is unsafe here since thumbnail_url is spliced into an
+  // HTML attribute, not just text content (see the call site above).
+  return String(s ?? '').replace(/[&<>"']/g, (c) => ({
+    '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;',
+  }[c]));
+}
+
+async function poll() {
+  // Fallback only — skipped whenever the WebSocket below is open, so this
+  // is a once-per-2s no-op except when that connection is down or unsupported.
+  if (ws && ws.readyState === WebSocket.OPEN) return;
+  try {
+    const res = await fetch('/nowplaying.json');
+    last = await res.json();
+    lastFetchedAt = performance.now();
+    refresh();
+  } catch (e) { /* keep showing the last known state */ }
+}
+
+let ws = null;
+function connectWs() {
+  let socket;
+  try {
+    const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
+    socket = new WebSocket(`${proto}//${location.host}/ws/nowplaying`);
+  } catch (e) {
+    return;  // no WebSocket support — poll() carries the whole load
+  }
+  ws = socket;
+  socket.onmessage = (ev) => {
+    try {
+      last = JSON.parse(ev.data);
+      lastFetchedAt = performance.now();
+      refresh();
+    } catch (e) { /* malformed frame — next one (or poll()) recovers */ }
+  };
+  socket.onclose = () => { if (ws === socket) ws = null; setTimeout(connectWs, 2000); };
+  socket.onerror = () => { try { socket.close(); } catch (e) {} };
+}
+
+// Draws the current state. Called when a message arrives and once a second to
+// advance the clock; nothing runs per frame, and nothing at all while OBS has
+// the source hidden.
+function refresh() {
+  if (!last || document.hidden) return;
+  const drift = last.playing ? (performance.now() - lastFetchedAt) / 1000 : 0;
+  render(last, (last.elapsed_seconds || 0) + drift);
+}
+
+connectWs();
+poll();
+setInterval(poll, 5000);
+setInterval(refresh, 1000);
+document.addEventListener('visibilitychange', refresh);
+</script>
+</body></html>

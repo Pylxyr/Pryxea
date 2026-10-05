@@ -1,0 +1,38 @@
+[package]
+name = "pryxea"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.85"
+description = "A small, native Twitch song-request radio: chat commands in, one Opus stream out for OBS."
+license = "Unlicense"
+publish = false
+
+[lib]
+name = "pryxea"
+path = "src/lib.rs"
+
+[[bin]]
+name = "pryxea"
+path = "src/main.rs"
+
+[dependencies]
+# current_thread runtime only: no worker pool, no per-thread stacks.
+tokio = { version = "1", default-features = false, features = ["rt", "net", "time", "sync", "macros", "io-util", "signal"] }
+hyper = { version = "1", default-features = false, features = ["http1", "server"] }
+hyper-util = { version = "0.1", default-features = false, features = ["tokio"] }
+bytes = "1"
+tokio-tungstenite = { version = "0.28", default-features = false, features = ["handshake"] }
+futures-util = { version = "0.3", default-features = false, features = ["std", "sink"] }
+serde_json = "1"
+
+[profile.release]
+opt-level = "z"
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+strip = true
+debug = false
+incremental = false
+
+[profile.dev]
+panic = "unwind"
