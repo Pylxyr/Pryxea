@@ -14,9 +14,10 @@ pub const DEFAULT_PORT: u16 = 8098;
 
 #[derive(Debug, Clone)]
 pub struct Ytdlp {
+    /// Explicit yt-dlp executable; otherwise the one in the home folder's `bin/` is used (downloaded on first use).
+    pub path: Option<PathBuf>,
     pub concurrency: usize,
     pub extract_timeout_secs: u64,
-    pub worker_idle_secs: u64,
     pub cache_ttl_secs: u64,
     pub player_clients: Vec<String>,
     pub cookies_file: Option<PathBuf>,
@@ -171,9 +172,9 @@ pub fn load(get: &dyn Fn(&str) -> Option<String>, home: &Path, data: &Path, logs
     let pot_provider_url = Some(r.text("YTDLP_POT_PROVIDER_URL")).filter(|u| !u.is_empty());
 
     let ytdlp = Ytdlp {
+        path: Some(r.text("YTDLP_PATH")).filter(|p| !p.is_empty()).map(PathBuf::from),
         concurrency: r.clamped("YTDLP_CONCURRENCY", 2, 1, 8) as usize,
         extract_timeout_secs: r.clamped("YTDLP_EXTRACT_TIMEOUT_SECONDS", 45, 10, 120) as u64,
-        worker_idle_secs: r.clamped("YTDLP_WORKER_IDLE_SECONDS", 120, 15, 3600) as u64,
         cache_ttl_secs: r.clamped("YTDLP_CACHE_TTL_SECONDS", 900, 0, 3600) as u64,
         player_clients,
         cookies_file,
@@ -242,7 +243,8 @@ mod tests {
         assert_eq!(s.audio_bitrate_kbps, 160);
         assert!(!s.pause_when_no_listeners);
         assert_eq!((s.ytdlp.concurrency, s.ytdlp.extract_timeout_secs), (2, 45));
-        assert_eq!((s.ytdlp.worker_idle_secs, s.ytdlp.cache_ttl_secs), (120, 900));
+        assert_eq!(s.ytdlp.cache_ttl_secs, 900);
+        assert!(s.ytdlp.path.is_none());
         assert_eq!(s.tunables_file, PathBuf::from("/h/data/tunables.json"));
         assert_eq!(s.queue_state_file, PathBuf::from("/h/data/queue_state.json"));
     }
