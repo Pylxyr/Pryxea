@@ -4,6 +4,7 @@
 //! built to stay small: a single-threaded async runtime, no framework, no
 //! bundled browser, and no child processes while the stream is idle.
 
+pub mod audio;
 pub mod commands;
 pub mod config;
 pub mod envfile;

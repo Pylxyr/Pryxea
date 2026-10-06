@@ -12,14 +12,6 @@ use crate::logging::Level;
 
 pub const DEFAULT_PORT: u16 = 8098;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Loudness {
-    /// Measure each track once, apply a fixed gain plus a limiter.
-    Static,
-    /// Play every track at its own level.
-    Off,
-}
-
 #[derive(Debug, Clone)]
 pub struct Ytdlp {
     pub concurrency: usize,
@@ -41,7 +33,6 @@ pub struct Settings {
     pub owner_id: String,
     pub port: u16,
     pub audio_bitrate_kbps: u32,
-    pub loudness: Loudness,
     pub pause_when_no_listeners: bool,
     pub ytdlp: Ytdlp,
     pub log_level: Level,
@@ -158,18 +149,10 @@ pub fn load(get: &dyn Fn(&str) -> Option<String>, home: &Path, data: &Path, logs
 
     let port = r.clamped("TWITCH_NOWPLAYING_PORT", i64::from(DEFAULT_PORT), 1, 65_535) as u16;
 
-    let loudness = match r.text("LOUDNESS_MODE").to_ascii_lowercase().as_str() {
-        "" | "static" => Loudness::Static,
-        "off" => Loudness::Off,
-        "dynamic" => {
-            r.warnings.push("LOUDNESS_MODE=dynamic is no longer available (it cost ~120 MB of RAM) - using 'static'.".into());
-            Loudness::Static
-        }
-        other => {
-            r.warnings.push(format!("LOUDNESS_MODE={other:?} is not one of static, off - using 'static'."));
-            Loudness::Static
-        }
-    };
+    // Songs play at their own volume. The setting is gone; say so instead of silently ignoring it.
+    if !r.text("LOUDNESS_MODE").is_empty() {
+        r.warnings.push("LOUDNESS_MODE is no longer used: songs always play at their own volume.".into());
+    }
 
     let cookies_raw = r.text("YTDLP_COOKIES_FILE");
     let cookies_file = (!cookies_raw.is_empty()).then(|| home.join(&cookies_raw));
@@ -218,7 +201,6 @@ pub fn load(get: &dyn Fn(&str) -> Option<String>, home: &Path, data: &Path, logs
         owner_id,
         port,
         audio_bitrate_kbps: r.clamped("AUDIO_BITRATE_KBPS", 160, 64, 256) as u32,
-        loudness,
         pause_when_no_listeners: r.bool("PAUSE_QUEUE_WHEN_NO_LISTENERS", false),
         ytdlp,
         log_level,
@@ -258,7 +240,6 @@ mod tests {
         let s = l.settings;
         assert_eq!(s.port, 8098);
         assert_eq!(s.audio_bitrate_kbps, 160);
-        assert_eq!(s.loudness, Loudness::Static);
         assert!(!s.pause_when_no_listeners);
         assert_eq!((s.ytdlp.concurrency, s.ytdlp.extract_timeout_secs), (2, 45));
         assert_eq!((s.ytdlp.worker_idle_secs, s.ytdlp.cache_ttl_secs), (120, 900));
@@ -286,12 +267,12 @@ mod tests {
     }
 
     #[test]
-    fn dynamic_loudness_is_retired_with_a_notice() {
+    fn the_old_loudness_setting_is_ignored_with_a_notice() {
         let mut pairs = CREDS.to_vec();
-        pairs.push(("LOUDNESS_MODE", "dynamic"));
+        pairs.push(("LOUDNESS_MODE", "static"));
         let l = load_with(&pairs);
-        assert_eq!(l.settings.loudness, Loudness::Static);
-        assert!(l.warnings[0].contains("no longer available"));
+        assert_eq!(l.warnings.len(), 1);
+        assert!(l.warnings[0].contains("own volume"), "{:?}", l.warnings);
     }
 
     #[test]
