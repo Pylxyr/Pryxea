@@ -1,0 +1,54 @@
+<!doctype html>
+<html lang="en"><head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="dark">
+<title>Pryxea · Settings</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@500;600;700&family=IBM+Plex+Sans:wght@400;500;600&family=IBM+Plex+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+<style>${css}</style>
+</head><body>
+<header class="masthead">
+  <div class="titles">
+    <h1>Pryxea</h1>
+    <p class="sub">settings</p>
+  </div>
+  <div class="chips">${status_chips}</div>
+</header>
+
+<main>
+${banner}
+
+<section class="card live-card" id="live-card">
+  <h2>Now Playing</h2>
+  <div id="np-body"><p class="empty">Loading…</p></div>
+</section>
+
+<form method="post" autocomplete="off">
+<input type="hidden" name="${form_marker}" value="1">
+
+  <section class="card">
+    <h2>Request limits</h2>
+    <p class="section-help">Live — no restart needed.</p>
+    <div class="grid">${tunable_rows}</div>
+  </section>
+
+  <section class="card">
+    <h2>Features</h2>
+    <div class="switches">${toggle_rows}</div>
+  </section>
+
+  <div class="actionbar">
+    <button type="submit">Save changes</button>
+  </div>
+</form>
+
+<section class="card">
+  <h2>Endpoints</h2>
+  <table class="info">${info_rows}</table>
+  <p class="help"><a href="/setup">Twitch accounts and setup</a></p>
+</section>
+</main>
+<script>${js}</script>
+</body></html>

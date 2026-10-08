@@ -104,6 +104,7 @@ impl Setup {
             body.push_str("</table>");
             body.push_str(&format!("<p class=\"dim\">Your Twitch application must list <code>{}</code> as an OAuth Redirect URL (dev.twitch.tv/console).</p>", esc(&self.redirect_uri)));
         }
+        body.push_str("<p><a href=\"/settings\">Request limits and radio settings</a></p>");
         body.push_str(&format!(
             "<h2>OBS</h2><p>Media Source: <code>http://127.0.0.1:{p}/stream.opus</code><br>Browser Source: <code>http://127.0.0.1:{p}/overlay</code></p>",
             p = self.main_port

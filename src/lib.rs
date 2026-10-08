@@ -14,6 +14,7 @@ pub mod hub;
 pub mod logging;
 pub mod net;
 pub mod paths;
+pub mod settings;
 pub mod setup;
 pub mod state;
 pub mod station;

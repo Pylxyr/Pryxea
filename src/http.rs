@@ -11,6 +11,7 @@ use std::task::{Context, Poll};
 use std::time::Duration;
 
 use bytes::Bytes;
+use http_body_util::{BodyExt, Limited};
 use futures_util::{SinkExt, StreamExt};
 use hyper::body::{Body, Frame, Incoming, SizeHint};
 use hyper::header::{self, HeaderValue};
@@ -26,6 +27,7 @@ use tokio_tungstenite::tungstenite::handshake::derive_accept_key;
 use tokio_tungstenite::tungstenite::protocol::{Message, Role};
 
 use crate::hub::{StreamHub, Subscription};
+use crate::settings::{self, SettingsPage};
 use crate::setup::Setup;
 use crate::state::Shared;
 use crate::thumb::ThumbProxy;
@@ -47,12 +49,13 @@ pub struct Ctx {
     /// Other ports this app also listens on (the OAuth redirect port), accepted in Host headers.
     pub extra_ports: Vec<u16>,
     pub setup: Option<Arc<Setup>>,
+    pub settings: Option<Arc<SettingsPage>>,
     pub thumbs: Arc<ThumbProxy>,
 }
 
 impl Ctx {
     pub fn new(shared: Arc<Shared>, hub: Arc<StreamHub>, port: u16) -> Ctx {
-        Ctx { shared, hub, port, extra_ports: Vec::new(), setup: None, thumbs: Arc::new(ThumbProxy::default()) }
+        Ctx { shared, hub, port, extra_ports: Vec::new(), setup: None, settings: None, thumbs: Arc::new(ThumbProxy::default()) }
     }
 
     fn ports(&self) -> Vec<u16> {
@@ -139,6 +142,9 @@ async fn route(req: Request<Incoming>, ctx: Arc<Ctx>) -> Result<Response<RespBod
         // 421 Misdirected Request: reached us under a name we don't serve.
         return Ok(plain(StatusCode::MISDIRECTED_REQUEST, "This server only answers on 127.0.0.1 / localhost."));
     }
+    if *req.method() == Method::POST && req.uri().path() == "/settings" {
+        return Ok(settings_post(req, &ctx).await);
+    }
     let head_only = match *req.method() {
         Method::GET => false,
         Method::HEAD => true,
@@ -149,6 +155,10 @@ async fn route(req: Request<Incoming>, ctx: Arc<Ctx>) -> Result<Response<RespBod
         "/" => redirect("/setup"),
         "/setup" => match &ctx.setup {
             Some(setup) => respond(StatusCode::OK, "text/html; charset=utf-8", setup.status_page()),
+            None => plain(StatusCode::NOT_FOUND, "Not found."),
+        },
+        "/settings" => match &ctx.settings {
+            Some(page) => protect(respond(StatusCode::OK, "text/html; charset=utf-8", page.render(None))),
             None => plain(StatusCode::NOT_FOUND, "Not found."),
         },
         "/oauth/start" => match &ctx.setup {
@@ -176,6 +186,44 @@ async fn route(req: Request<Incoming>, ctx: Arc<Ctx>) -> Result<Response<RespBod
         "/ws/nowplaying" => websocket(req, ctx),
         _ => plain(StatusCode::NOT_FOUND, "Not found."),
     })
+}
+
+/// Keeps a page out of caches and frames (clickjacking).
+fn protect(mut resp: Response<RespBody>) -> Response<RespBody> {
+    let h = resp.headers_mut();
+    h.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    h.insert(header::X_FRAME_OPTIONS, HeaderValue::from_static("DENY"));
+    h.insert(header::CONTENT_SECURITY_POLICY, HeaderValue::from_static("frame-ancestors 'none'"));
+    resp
+}
+
+async fn settings_post(req: Request<Incoming>, ctx: &Ctx) -> Response<RespBody> {
+    let Some(page) = &ctx.settings else { return plain(StatusCode::NOT_FOUND, "Not found.") };
+    let header_of = |name: header::HeaderName| req.headers().get(name).and_then(|v| v.to_str().ok()).map(str::to_string);
+    let site = req.headers().get("sec-fetch-site").and_then(|v| v.to_str().ok()).map(str::to_string);
+    let (origin, referer, host) = (header_of(header::ORIGIN), header_of(header::REFERER), header_of(header::HOST));
+    if !settings::origin_ok(origin.as_deref(), referer.as_deref(), host.as_deref(), site.as_deref()) {
+        crate::warn!("Rejected a settings change: its Origin/Referer/Sec-Fetch-Site didn't match this server (possible cross-site request).");
+        return protect(plain(StatusCode::FORBIDDEN, "Origin check failed \u{2014} refusing to save."));
+    }
+    let is_form = header_of(header::CONTENT_TYPE).is_some_and(|ct| ct.to_ascii_lowercase().starts_with("application/x-www-form-urlencoded"));
+    if !is_form {
+        return protect(plain(StatusCode::UNSUPPORTED_MEDIA_TYPE, "Expected a form submission."));
+    }
+    let announced = header_of(header::CONTENT_LENGTH).and_then(|v| v.parse::<usize>().ok());
+    if announced.is_some_and(|n| n > settings::MAX_FORM_BYTES) {
+        return protect(plain(StatusCode::PAYLOAD_TOO_LARGE, "That's too big for a settings form."));
+    }
+    let body = match Limited::new(req.into_body(), settings::MAX_FORM_BYTES).collect().await {
+        Ok(collected) => collected.to_bytes(),
+        Err(_) => return protect(plain(StatusCode::PAYLOAD_TOO_LARGE, "That's too big for a settings form.")),
+    };
+    let form = crate::net::url::parse_query(&String::from_utf8_lossy(&body));
+    let (status, html) = match page.apply(&form) {
+        Ok(()) => (StatusCode::OK, page.render(Some(("Saved.", false)))),
+        Err(errors) => (StatusCode::BAD_REQUEST, page.render(Some((&format!("Nothing was saved \u{2014} {}", errors.join("; ")), true)))),
+    };
+    protect(respond(status, "text/html; charset=utf-8", html))
 }
 
 fn redirect(to: &str) -> Response<RespBody> {

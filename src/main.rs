@@ -13,6 +13,7 @@ use pryxea::logging;
 use pryxea::net::http::Client;
 use pryxea::net::url::Url;
 use pryxea::paths::Dirs;
+use pryxea::settings::SettingsPage;
 use pryxea::setup::Setup;
 use pryxea::state::Shared;
 use pryxea::station::{Deps, HttpOpener, ResolverLookup, Station};
@@ -96,14 +97,16 @@ async fn run() -> ExitCode {
     let ytdlp_exe = settings.ytdlp.path.clone().unwrap_or_else(|| tools::ytdlp_path(&bin_dir));
     let resolver = Resolver::new(settings.ytdlp.clone(), ytdlp_exe, dirs.data.join("ytdlp-cache"), shared.clone());
     let (chat, chat_rx) = ChatOut::channel();
+    let tunables = Arc::new(JsonStore::new(&settings.tunables_file));
+    let toggles = Arc::new(JsonStore::new(&settings.toggles_file));
     let station = Station::new(Deps {
         shared: shared.clone(),
         engine,
         hub: hub.clone(),
         lookup: Arc::new(ResolverLookup(resolver.clone())),
         opener: Arc::new(HttpOpener(http_client.clone())),
-        tunables: Arc::new(JsonStore::new(&settings.tunables_file)),
-        toggles: Arc::new(JsonStore::new(&settings.toggles_file)),
+        tunables: tunables.clone(),
+        toggles: toggles.clone(),
         queue_file: Some(Arc::new(JsonStore::new(&settings.queue_state_file))),
         chat: chat.clone(),
         pause_when_no_listeners: settings.pause_when_no_listeners,
@@ -154,7 +157,15 @@ async fn run() -> ExitCode {
     tokio::spawn(keep_tools_current(http_client.clone(), bin_dir, JsonStore::new(dirs.data.join("tools.json")), resolver, settings.ytdlp.path.is_some(), settings.ytdlp.js_runtime_path.is_some()));
 
     // ---- the web server (OBS, overlay, setup page)
-    let mut ctx = Ctx::new(shared, hub, settings.port);
+    let info = vec![
+        ("OBS Media Source".to_string(), format!("http://127.0.0.1:{}/stream.opus", settings.port)),
+        ("OBS Browser Source".to_string(), format!("http://127.0.0.1:{}/overlay", settings.port)),
+        ("Setup page".to_string(), format!("http://127.0.0.1:{}/setup", settings.port)),
+        ("Home folder".to_string(), dirs.home.display().to_string()),
+        ("Version".to_string(), env!("CARGO_PKG_VERSION").to_string()),
+    ];
+    let mut ctx = Ctx::new(shared.clone(), hub, settings.port);
+    ctx.settings = Some(Arc::new(SettingsPage::new(tunables, toggles, shared, info)));
     ctx.extra_ports = vec![redirect_port];
     ctx.setup = Some(Arc::new(Setup::new(auth, settings.redirect_uri.clone(), settings.bot_id.clone(), settings.owner_id.clone(), settings.port, link_rx, loaded.problems.clone())));
     let ctx = Arc::new(ctx);

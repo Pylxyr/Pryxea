@@ -20,6 +20,17 @@ Python, no ffmpeg processes.
 Nothing else is recognised: no aliases, no pause/resume, no vote-skip, no
 remove/position, no block list.
 
+## Settings page
+
+<http://127.0.0.1:8098/settings> edits the request limits (per-chatter pending,
+cooldown, queue cap, longest song) and the radio autoplay switch, live, with no
+restart. It also shows what is playing and queued. The same values live in
+`data/tunables.json` and `data/toggles.json`, and `!radio on|off` (mods) flips the
+switch from chat.
+
+Saving only works from the page itself: a form submitted by another website is
+refused, and a rejected form changes nothing.
+
 ## OBS setup
 
 - Media Source: `http://127.0.0.1:8098/stream.opus`
@@ -73,8 +84,8 @@ Python Twitch-Radio are picked up as they are.
 | 2 | Audio engine: decode (Opus, AAC-LC), resample, Opus/Ogg encode, gapless handoff | done |
 | 3 | HTTPS client, seekable range source, yt-dlp lookups, tool installer/updater, radio mix | done |
 | 4 | Twitch (OAuth, chat in and out), queue and player, radio autoplay, setup page, thumbnail relay, `main` wiring | done |
-| 5 | `/settings` page for the request limits and the radio switch | next |
-| 6 | Tray icon, packaging, CI, self-update | |
+| 5 | `/settings` page for the request limits and the radio switch | done |
+| 6 | Tray icon, packaging, CI, self-update | next |
 
 ## How a request flows
 
@@ -126,7 +137,7 @@ with no track and no listener the engine sleeps entirely.
 
 | | |
 |---|---|
-| The complete bot, release binary | **3.0 MB** |
+| The complete bot, release binary | **3.1 MB** |
 | Resident memory, idle, chat connected | **5.1 MB**, 2 threads |
 | Resident memory, a song playing with OBS listening | ~6 MB (about 11 MB peak while decoding AAC music) |
 | CPU while streaming | ~1.2 % of one core (Opus), ~1.4 % (AAC + resample) |
