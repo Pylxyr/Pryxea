@@ -26,6 +26,14 @@ pub struct Ytdlp {
     pub js_runtime_name: String,
 }
 
+/// Overrides for Twitch's service addresses. Only for testing against a local fake; unset in normal use.
+#[derive(Debug, Clone, Default)]
+pub struct TwitchUrls {
+    pub id: Option<String>,
+    pub api: Option<String>,
+    pub eventsub: Option<String>,
+}
+
 #[derive(Debug, Clone)]
 pub struct Settings {
     pub client_id: String,
@@ -33,6 +41,9 @@ pub struct Settings {
     pub bot_id: String,
     pub owner_id: String,
     pub port: u16,
+    /// Where Twitch sends the browser after authorizing; must match the Twitch application settings.
+    pub redirect_uri: String,
+    pub twitch_urls: TwitchUrls,
     pub audio_bitrate_kbps: u32,
     pub pause_when_no_listeners: bool,
     pub ytdlp: Ytdlp,
@@ -195,12 +206,31 @@ pub fn load(get: &dyn Fn(&str) -> Option<String>, home: &Path, data: &Path, logs
         }
     };
 
+    let redirect_uri = {
+        let raw = r.text("TWITCH_REDIRECT_URI");
+        let default = "http://localhost:4343/oauth/callback".to_string();
+        match (raw.is_empty(), crate::net::url::Url::parse(&raw)) {
+            (true, _) => default,
+            (false, Some(u)) if !u.https && u.host == "localhost" && u.target.ends_with("/oauth/callback") => raw,
+            (false, Some(u)) if u.https && u.target.ends_with("/oauth/callback") => raw,
+            _ => {
+                r.warnings.push(format!("TWITCH_REDIRECT_URI={raw:?} is not a usable http://localhost:<port>/oauth/callback address - using the default."));
+                default
+            }
+        }
+    };
+    let twitch_urls = {
+        let url = |name: &str| Some(r.text(name)).filter(|v| !v.is_empty());
+        TwitchUrls { id: url("TWITCH_ID_URL"), api: url("TWITCH_API_URL"), eventsub: url("TWITCH_EVENTSUB_URL") }
+    };
     let settings = Settings {
         client_id,
         client_secret,
         bot_id,
         owner_id,
         port,
+        redirect_uri,
+        twitch_urls,
         audio_bitrate_kbps: r.clamped("AUDIO_BITRATE_KBPS", 160, 64, 256) as u32,
         pause_when_no_listeners: r.bool("PAUSE_QUEUE_WHEN_NO_LISTENERS", false),
         ytdlp,
@@ -240,6 +270,7 @@ mod tests {
         assert!(l.warnings.is_empty(), "{:?}", l.warnings);
         let s = l.settings;
         assert_eq!(s.port, 8098);
+        assert_eq!(s.redirect_uri, "http://localhost:4343/oauth/callback");
         assert_eq!(s.audio_bitrate_kbps, 160);
         assert!(!s.pause_when_no_listeners);
         assert_eq!((s.ytdlp.concurrency, s.ytdlp.extract_timeout_secs), (2, 45));
@@ -266,6 +297,22 @@ mod tests {
         assert!(!l.twitch_ready());
         assert_eq!(l.problems.len(), 3, "{:?}", l.problems);
         assert!(l.problems.iter().any(|p| p.contains("TWITCH_BOT_ID must be digits")));
+    }
+
+    #[test]
+    fn the_redirect_uri_must_be_a_local_oauth_callback() {
+        let mut ok = CREDS.to_vec();
+        ok.push(("TWITCH_REDIRECT_URI", "http://localhost:5000/oauth/callback"));
+        let l = load_with(&ok);
+        assert_eq!(l.settings.redirect_uri, "http://localhost:5000/oauth/callback");
+        assert!(l.warnings.is_empty());
+        for bad in ["http://evil.example/oauth/callback", "http://localhost:5000/elsewhere", "not a url"] {
+            let mut pairs = CREDS.to_vec();
+            pairs.push(("TWITCH_REDIRECT_URI", bad));
+            let l = load_with(&pairs);
+            assert_eq!(l.settings.redirect_uri, "http://localhost:4343/oauth/callback", "{bad}");
+            assert_eq!(l.warnings.len(), 1, "{bad}");
+        }
     }
 
     #[test]

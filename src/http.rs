@@ -26,7 +26,9 @@ use tokio_tungstenite::tungstenite::handshake::derive_accept_key;
 use tokio_tungstenite::tungstenite::protocol::{Message, Role};
 
 use crate::hub::{StreamHub, Subscription};
+use crate::setup::Setup;
 use crate::state::Shared;
+use crate::thumb::ThumbProxy;
 
 /// The overlay is a single static page, compiled into the binary.
 const OVERLAY_HTML: &str = include_str!("../assets/overlay.html");
@@ -40,17 +42,32 @@ const MAX_CONNECTIONS: usize = 64;
 pub struct Ctx {
     pub shared: Arc<Shared>,
     pub hub: Arc<StreamHub>,
+    /// The main port (what OBS is pointed at).
     pub port: u16,
+    /// Other ports this app also listens on (the OAuth redirect port), accepted in Host headers.
+    pub extra_ports: Vec<u16>,
+    pub setup: Option<Arc<Setup>>,
+    pub thumbs: Arc<ThumbProxy>,
+}
+
+impl Ctx {
+    pub fn new(shared: Arc<Shared>, hub: Arc<StreamHub>, port: u16) -> Ctx {
+        Ctx { shared, hub, port, extra_ports: Vec::new(), setup: None, thumbs: Arc::new(ThumbProxy::default()) }
+    }
+
+    fn ports(&self) -> Vec<u16> {
+        std::iter::once(self.port).chain(self.extra_ports.iter().copied()).collect()
+    }
 }
 
 // -------------------------------------------------------------------- guard
 
 /// Every Host header a legitimate local client can send. Anything else is
 /// what a DNS-rebinding page looks like (its own hostname resolving to 127.0.0.1).
-pub fn host_allowed(host: Option<&str>, port: u16) -> bool {
+pub fn host_allowed(host: Option<&str>, ports: &[u16]) -> bool {
     let Some(host) = host else { return false };
     let host = host.trim().to_ascii_lowercase();
-    ["127.0.0.1", "localhost", "[::1]"].iter().any(|name| host == format!("{name}:{port}"))
+    ["127.0.0.1", "localhost", "[::1]"].iter().any(|name| ports.iter().any(|port| host == format!("{name}:{port}")))
 }
 
 // --------------------------------------------------------------------- body
@@ -118,7 +135,7 @@ fn plain(status: StatusCode, text: &'static str) -> Response<RespBody> {
 
 async fn route(req: Request<Incoming>, ctx: Arc<Ctx>) -> Result<Response<RespBody>, Infallible> {
     let host = req.headers().get(header::HOST).and_then(|v| v.to_str().ok());
-    if !host_allowed(host, ctx.port) {
+    if !host_allowed(host, &ctx.ports()) {
         // 421 Misdirected Request: reached us under a name we don't serve.
         return Ok(plain(StatusCode::MISDIRECTED_REQUEST, "This server only answers on 127.0.0.1 / localhost."));
     }
@@ -127,7 +144,31 @@ async fn route(req: Request<Incoming>, ctx: Arc<Ctx>) -> Result<Response<RespBod
         Method::HEAD => true,
         _ => return Ok(plain(StatusCode::METHOD_NOT_ALLOWED, "Method not allowed.")),
     };
+    let query = req.uri().query().unwrap_or("").to_string();
     Ok(match req.uri().path() {
+        "/" => redirect("/setup"),
+        "/setup" => match &ctx.setup {
+            Some(setup) => respond(StatusCode::OK, "text/html; charset=utf-8", setup.status_page()),
+            None => plain(StatusCode::NOT_FOUND, "Not found."),
+        },
+        "/oauth/start" => match &ctx.setup {
+            Some(setup) => {
+                let who = crate::net::url::parse_query(&query).into_iter().find(|(k, _)| k == "who").map(|(_, v)| v).unwrap_or_default();
+                match setup.start(&who) {
+                    Ok(url) => redirect(&url),
+                    Err((status, html)) => respond(StatusCode::from_u16(status).unwrap_or(StatusCode::BAD_REQUEST), "text/html; charset=utf-8", html),
+                }
+            }
+            None => plain(StatusCode::NOT_FOUND, "Not found."),
+        },
+        "/oauth/callback" => match ctx.setup.clone() {
+            Some(setup) => {
+                let (status, html) = tokio::task::spawn_blocking(move || setup.callback(&query)).await.unwrap_or((500, "Something went wrong.".to_string()));
+                respond(StatusCode::from_u16(status).unwrap_or(StatusCode::BAD_REQUEST), "text/html; charset=utf-8", html)
+            }
+            None => plain(StatusCode::NOT_FOUND, "Not found."),
+        },
+        "/thumb-proxy" => thumb_response(&ctx, &query).await,
         "/healthz" => json_response(&ctx.shared.health_json()),
         "/nowplaying.json" => json_response(&ctx.shared.nowplaying_json()),
         "/overlay" => respond(StatusCode::OK, "text/html; charset=utf-8", OVERLAY_HTML),
@@ -135,6 +176,40 @@ async fn route(req: Request<Incoming>, ctx: Arc<Ctx>) -> Result<Response<RespBod
         "/ws/nowplaying" => websocket(req, ctx),
         _ => plain(StatusCode::NOT_FOUND, "Not found."),
     })
+}
+
+fn redirect(to: &str) -> Response<RespBody> {
+    let mut resp = Response::new(RespBody::Full(None));
+    *resp.status_mut() = StatusCode::FOUND;
+    if let Ok(v) = HeaderValue::from_str(to) {
+        resp.headers_mut().insert(header::LOCATION, v);
+    }
+    resp.headers_mut().insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    resp
+}
+
+async fn thumb_response(ctx: &Arc<Ctx>, query: &str) -> Response<RespBody> {
+    let url = crate::net::url::parse_query(query).into_iter().find(|(k, _)| k == "url").map(|(_, v)| v).unwrap_or_default();
+    let thumbs = ctx.thumbs.clone();
+    match tokio::task::spawn_blocking(move || thumbs.fetch(&url)).await {
+        Ok(Ok((bytes, content_type))) => {
+            let mut resp = Response::new(RespBody::Full(Some(Bytes::from(bytes))));
+            let h = resp.headers_mut();
+            if let Ok(v) = HeaderValue::from_str(&content_type) {
+                h.insert(header::CONTENT_TYPE, v);
+            }
+            h.insert(header::ACCESS_CONTROL_ALLOW_ORIGIN, HeaderValue::from_static("*"));
+            h.insert(header::X_CONTENT_TYPE_OPTIONS, HeaderValue::from_static("nosniff"));
+            h.insert(header::CACHE_CONTROL, HeaderValue::from_static("public, max-age=3600"));
+            resp
+        }
+        Ok(Err(e)) => plain_owned(StatusCode::from_u16(e.status()).unwrap_or(StatusCode::BAD_GATEWAY), e.message()),
+        Err(_) => plain(StatusCode::BAD_GATEWAY, "Upstream fetch failed"),
+    }
+}
+
+fn plain_owned(status: StatusCode, text: &'static str) -> Response<RespBody> {
+    plain(status, text)
 }
 
 fn stream_response(ctx: &Ctx, head_only: bool) -> Response<RespBody> {
@@ -271,12 +346,13 @@ mod tests {
 
     #[test]
     fn only_loopback_names_on_our_port_are_allowed() {
-        assert!(host_allowed(Some("127.0.0.1:8098"), 8098));
-        assert!(host_allowed(Some("LOCALHOST:8098"), 8098));
-        assert!(host_allowed(Some(" [::1]:8098 "), 8098));
-        assert!(!host_allowed(Some("evil.example:8098"), 8098));
-        assert!(!host_allowed(Some("127.0.0.1:9999"), 8098));
-        assert!(!host_allowed(Some("127.0.0.1"), 8098));
-        assert!(!host_allowed(None, 8098));
+        assert!(host_allowed(Some("127.0.0.1:8098"), &[8098]));
+        assert!(host_allowed(Some("LOCALHOST:8098"), &[8098]));
+        assert!(host_allowed(Some(" [::1]:8098 "), &[8098]));
+        assert!(host_allowed(Some("localhost:4343"), &[8098, 4343]));
+        assert!(!host_allowed(Some("evil.example:8098"), &[8098]));
+        assert!(!host_allowed(Some("127.0.0.1:9999"), &[8098, 4343]));
+        assert!(!host_allowed(Some("127.0.0.1"), &[8098]));
+        assert!(!host_allowed(None, &[8098]));
     }
 }

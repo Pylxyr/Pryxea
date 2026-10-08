@@ -65,7 +65,9 @@ pub enum ResolveError {
     NotFound,
     /// Private, removed, region-locked, age-gated...
     Unavailable(String),
-    /// A live stream or a delivery format we can't play.
+    /// A live stream (no fixed length, can't be queued).
+    Live,
+    /// A delivery format or codec we can't play.
     Unplayable(String),
     TimedOut,
     /// yt-dlp isn't installed or couldn't start.
@@ -79,6 +81,7 @@ impl fmt::Display for ResolveError {
             ResolveError::UnsupportedSource => f.write_str("only YouTube links are supported"),
             ResolveError::NotFound => f.write_str("nothing found"),
             ResolveError::Unavailable(m) => write!(f, "unavailable: {m}"),
+            ResolveError::Live => f.write_str("live streams are not supported"),
             ResolveError::Unplayable(m) => write!(f, "can't be played: {m}"),
             ResolveError::TimedOut => f.write_str("the lookup timed out"),
             ResolveError::ToolMissing(m) => write!(f, "yt-dlp is not available: {m}"),
@@ -102,6 +105,8 @@ enum Mode {
 struct Plan<'a> {
     cfg: &'a Ytdlp,
     cache_dir: &'a Path,
+    /// (runtime name, executable) when a JavaScript runtime is available.
+    js: Option<(String, PathBuf)>,
 }
 
 impl Plan<'_> {
@@ -133,15 +138,13 @@ impl Plan<'_> {
         if let Some(cookies) = &self.cfg.cookies_file {
             a.extend(["--cookies".into(), cookies.display().to_string()]);
         }
-        let runtime = match &self.cfg.js_runtime_path {
-            Some(p) => format!("{}:{}", self.cfg.js_runtime_name, p.display()),
-            None => self.cfg.js_runtime_name.clone(),
-        };
-        match (mode, &self.cfg.js_runtime_path) {
-            // The fast attempt uses one quick runtime only, as the original did.
-            (Mode::Track { fast: true }, Some(_)) => a.extend(["--no-js-runtimes".into(), "--js-runtimes".into(), runtime]),
-            (_, Some(_)) => a.extend(["--js-runtimes".into(), runtime]),
-            _ => {}
+        if let Some((name, path)) = &self.js {
+            let runtime = format!("{name}:{}", path.display());
+            match mode {
+                // The fast attempt uses one quick runtime only, as the original did.
+                Mode::Track { fast: true } => a.extend(["--no-js-runtimes".into(), "--js-runtimes".into(), runtime]),
+                _ => a.extend(["--js-runtimes".into(), runtime]),
+            }
         }
         // `--` so a search that starts with a dash can never be read as an option.
         a.push("--".into());
@@ -313,7 +316,7 @@ pub fn parse_resolved(root: &Value, fallback_url: &str) -> Result<Resolved, Reso
         root
     };
     if info.get("is_live").and_then(Value::as_bool) == Some(true) || matches!(str_of(info, "live_status"), Some("is_live" | "is_upcoming" | "post_live")) {
-        return Err(ResolveError::Unplayable("live streams are not supported".into()));
+        return Err(ResolveError::Live);
     }
     // The selected format's fields sit at the top level; merged downloads list them separately.
     let fmt: &Value = [Some(info), info.pointer("/requested_downloads/0"), info.get("requested_formats").and_then(Value::as_array).and_then(|a| a.iter().find(|f| str_of(f, "vcodec").is_none_or(|v| v == "none")))]
@@ -377,6 +380,8 @@ pub struct Resolver {
     exe: PathBuf,
     cache_dir: PathBuf,
     shared: Arc<Shared>,
+    /// A JS runtime found after start-up (it is downloaded in the background on first run).
+    js_override: Mutex<Option<(String, PathBuf)>>,
     cache: Mutex<HashMap<String, (Instant, Resolved)>>,
     inflight: Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
     permits: Semaphore,
@@ -385,7 +390,17 @@ pub struct Resolver {
 impl Resolver {
     pub fn new(cfg: Ytdlp, exe: PathBuf, cache_dir: PathBuf, shared: Arc<Shared>) -> Arc<Resolver> {
         let permits = Semaphore::new(cfg.concurrency);
-        Arc::new(Resolver { cfg, exe, cache_dir, shared, cache: Mutex::default(), inflight: Mutex::default(), permits })
+        Arc::new(Resolver { cfg, exe, cache_dir, shared, js_override: Mutex::default(), cache: Mutex::default(), inflight: Mutex::default(), permits })
+    }
+
+    /// Tells the resolver about a JavaScript runtime that became available (e.g. QuickJS just downloaded).
+    pub fn set_js_runtime(&self, name: &str, path: PathBuf) {
+        *self.js_override.lock().unwrap_or_else(|e| e.into_inner()) = Some((name.to_string(), path));
+    }
+
+    fn plan(&self) -> Plan<'_> {
+        let js = self.js_override.lock().unwrap_or_else(|e| e.into_inner()).clone().or_else(|| self.cfg.js_runtime_path.clone().map(|p| (self.cfg.js_runtime_name.clone(), p)));
+        Plan { cfg: &self.cfg, cache_dir: &self.cache_dir, js }
     }
 
     fn cached(&self, key: &str) -> Option<Resolved> {
@@ -393,6 +408,13 @@ impl Resolver {
         let mut cache = self.cache.lock().unwrap_or_else(|e| e.into_inner());
         cache.retain(|_, (at, _)| at.elapsed() < ttl);
         cache.get(key).map(|(_, r)| r.clone())
+    }
+
+    /// Drops a cached lookup, e.g. after its stream URL turned out to be stale.
+    pub fn forget(&self, target: &str) {
+        let mut cache = self.cache.lock().unwrap_or_else(|e| e.into_inner());
+        cache.remove(target);
+        cache.remove(&format!("ytsearch1:{}", target.to_lowercase()));
     }
 
     /// Looks up a YouTube link or a search phrase.
@@ -439,7 +461,7 @@ impl Resolver {
     }
 
     fn resolve_blocking(&self, target: &str) -> Result<Resolved, ResolveError> {
-        let plan = Plan { cfg: &self.cfg, cache_dir: &self.cache_dir };
+        let plan = self.plan();
         let slow = Duration::from_secs(self.cfg.extract_timeout_secs);
         if plan.fast_allowed() {
             match self.run_track(&plan, Mode::Track { fast: true }, target, FAST_TIMEOUT.min(slow)) {
@@ -478,7 +500,7 @@ impl Resolver {
         let Ok(_permit) = self.permits.acquire().await else { return Vec::new() };
         let me = Arc::clone(self);
         let json = tokio::task::spawn_blocking(move || {
-            let plan = Plan { cfg: &me.cfg, cache_dir: &me.cache_dir };
+            let plan = me.plan();
             me.run_json(&plan, Mode::Mix, &url, MIX_TIMEOUT)
         })
         .await;
@@ -512,8 +534,12 @@ mod tests {
         }
     }
 
+    fn plan_for(cfg: &Ytdlp) -> Plan<'_> {
+        Plan { cfg, cache_dir: Path::new("/c"), js: cfg.js_runtime_path.clone().map(|p| (cfg.js_runtime_name.clone(), p)) }
+    }
+
     fn plan_args(cfg: &Ytdlp, mode: Mode, target: &str) -> Vec<String> {
-        Plan { cfg, cache_dir: Path::new("/c") }.args(mode, target)
+        plan_for(cfg).args(mode, target)
     }
 
     fn has_pair(args: &[String], a: &str, b: &str) -> bool {
@@ -546,11 +572,11 @@ mod tests {
     #[test]
     fn cookies_or_pinned_clients_disable_the_fast_path_and_options_pass_through() {
         let mut c = cfg();
-        assert!(Plan { cfg: &c, cache_dir: Path::new("/c") }.fast_allowed());
+        assert!(plan_for(&c).fast_allowed());
         c.cookies_file = Some(PathBuf::from("/h/cookies.txt"));
         c.player_clients = vec!["web".into(), "tv".into()];
         c.pot_provider_url = Some("http://127.0.0.1:4416".into());
-        assert!(!Plan { cfg: &c, cache_dir: Path::new("/c") }.fast_allowed());
+        assert!(!plan_for(&c).fast_allowed());
         let a = plan_args(&c, Mode::Track { fast: false }, "x");
         assert!(has_pair(&a, "--cookies", "/h/cookies.txt"));
         assert!(has_pair(&a, "--extractor-args", "youtube:player_client=web,tv"));
@@ -609,8 +635,8 @@ mod tests {
             j[k] = v;
             parse_resolved(&j, "x")
         };
-        assert!(matches!(with("is_live", json!(true)), Err(ResolveError::Unplayable(m)) if m.contains("live")));
-        assert!(matches!(with("live_status", json!("is_upcoming")), Err(ResolveError::Unplayable(_))));
+        assert_eq!(with("is_live", json!(true)), Err(ResolveError::Live));
+        assert_eq!(with("live_status", json!("is_upcoming")), Err(ResolveError::Live));
         assert!(matches!(with("protocol", json!("m3u8_native")), Err(ResolveError::Unplayable(_))));
         assert!(matches!(with("url", json!("https://h/master.m3u8?x=1")), Err(ResolveError::Unplayable(_))));
         assert!(matches!(with("url", json!("file:///etc/passwd")), Err(ResolveError::Failed(_))));

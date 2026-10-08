@@ -82,19 +82,26 @@ pub struct Request {
     pub url: String,
     pub headers: Vec<(String, String)>,
     pub body: Vec<u8>,
+    /// When false, a 3xx answer is returned as is, so the caller can vet where it points.
+    pub follow_redirects: bool,
 }
 
 impl Request {
     pub fn get(url: impl Into<String>) -> Request {
-        Request { method: "GET", url: url.into(), headers: Vec::new(), body: Vec::new() }
+        Request { method: "GET", url: url.into(), headers: Vec::new(), body: Vec::new(), follow_redirects: true }
     }
 
     pub fn post(url: impl Into<String>, body: Vec<u8>) -> Request {
-        Request { method: "POST", url: url.into(), headers: Vec::new(), body }
+        Request { method: "POST", url: url.into(), headers: Vec::new(), body, follow_redirects: true }
     }
 
     pub fn header(mut self, name: &str, value: &str) -> Request {
         self.headers.push((name.to_string(), value.to_string()));
+        self
+    }
+
+    pub fn no_redirects(mut self) -> Request {
+        self.follow_redirects = false;
         self
     }
 
@@ -175,7 +182,8 @@ impl Client {
         client
     }
 
-    fn tls_config(&self) -> Result<Arc<ClientConfig>> {
+    /// The shared TLS settings (OS trust store), for connections made outside this client.
+    pub fn tls_config(&self) -> Result<Arc<ClientConfig>> {
         self.tls
             .get_or_init(|| {
                 use rustls_platform_verifier::BuilderVerifierExt;
@@ -226,7 +234,7 @@ impl Client {
         }
         for _ in 0..=MAX_REDIRECTS {
             let resp = self.send_once(&url, method, &headers, body)?;
-            let redirect = matches!(resp.status, 301 | 302 | 303 | 307 | 308);
+            let redirect = req.follow_redirects && matches!(resp.status, 301 | 302 | 303 | 307 | 308);
             let Some(location) = redirect.then(|| resp.header("location")).flatten() else { return Ok(resp) };
             let next = url.join(location).ok_or_else(|| HttpError::Protocol(format!("bad redirect target {:?}", truncate(location))))?;
             if url.https && !next.https {

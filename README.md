@@ -26,7 +26,7 @@ remove/position, no block list.
 - Browser Source: `http://127.0.0.1:8098/overlay`
 
 The server listens on loopback only and rejects requests whose `Host` header
-isn't `127.0.0.1`, `localhost` or `[::1]` on the configured port (DNS rebinding).
+isn't `127.0.0.1`, `localhost` or `[::1]` on one of its ports (DNS rebinding).
 
 ## Configuration
 
@@ -47,16 +47,43 @@ cargo test
 
 Requires Rust 1.85+.
 
+## Quick start
+
+1. Register an application at <https://dev.twitch.tv/console/apps>. Add
+   `http://localhost:4343/oauth/callback` as an OAuth Redirect URL, and note the
+   client ID and secret.
+2. Run `pryxea` once. It creates its home folder with a commented `.env`
+   (`%APPDATA%\Pryxea`, `~/.local/share/pryxea`, or `$PRYXEA_HOME`). Fill in the
+   client ID and secret, plus `TWITCH_BOT_ID` (the bot account's numeric user ID)
+   and `TWITCH_OWNER_ID` (the channel's), then run it again.
+3. Open <http://127.0.0.1:8098/setup> and authorize the bot account. Authorize the
+   broadcaster account too unless the bot is a moderator of the channel.
+4. In OBS add a Media Source (`http://127.0.0.1:8098/stream.opus`) and a Browser
+   Source (`http://127.0.0.1:8098/overlay`).
+
+yt-dlp and a small JavaScript runtime are downloaded automatically the first time
+a song is requested. Existing `.env`, token, queue and settings files from the
+Python Twitch-Radio are picked up as they are.
+
 ## Status
 
 | Step | Piece | State |
 |---|---|---|
 | 1 | Config, `.env`, JSON stores, five-command parser, Ogg stream hub, HTTP + WebSocket server, overlay | done |
-| 2 | Audio engine: decode (Opus, AAC-LC), resample, in-process Opus/Ogg encode, gapless handoff | done |
-| 3 | HTTPS client + seekable range source, yt-dlp lookups (on demand), tool installer/updater, resolve cache, radio mix | done |
-| 4 | Twitch: OAuth, EventSub chat, send-message, the five commands wired to the queue | next |
-| 5 | Queue, player loop, queue persistence, `/thumb-proxy`, `/settings` page | |
-| 6 | Tray icon, packaging, CI | |
+| 2 | Audio engine: decode (Opus, AAC-LC), resample, Opus/Ogg encode, gapless handoff | done |
+| 3 | HTTPS client, seekable range source, yt-dlp lookups, tool installer/updater, radio mix | done |
+| 4 | Twitch (OAuth, chat in and out), queue and player, radio autoplay, setup page, thumbnail relay, `main` wiring | done |
+| 5 | `/settings` page for the request limits and the radio switch | next |
+| 6 | Tray icon, packaging, CI, self-update | |
+
+## How a request flows
+
+`!sr` is checked against the limits (per-chatter pending, cooldown, queue cap,
+duplicates, length), looked up, and queued ahead of any radio filler. The player
+resolves the next song about 20 s before the current one ends and opens its
+stream 3 s before the end, so songs join without a gap. When the queue is empty
+and radio is on, YouTube's Mix supplies a related song. `!skip` works for mods
+and for whoever requested the current song. The queue survives a restart.
 
 ## Audio
 
@@ -95,17 +122,18 @@ with no track and no listener the engine sleeps entirely.
   corporate HTTPS inspection keeps working. Media is read in 4 MiB `Range`
   requests with reconnect and resume, so a dropped connection never restarts a song.
 
-## Footprint (steps 1-3, Linux x86-64, measured)
+## Footprint (Linux x86-64, measured)
 
 | | |
 |---|---|
-| `pryxea` binary today (server only) | 0.76 MB |
-| Everything but Twitch (HTTPS, resolver, decoder, engine): the `lookup` example | 2.23 MB |
-| RSS at idle | 2.5 MB, 1 thread |
-| RSS with 20 WebSockets + 5 stream listeners | 5.4 MB |
-| Engine streaming 20 s of music, decode + encode, peak RSS | 11 MB |
-| CPU doing that | ~1.2 % of one core (Opus), ~1.4 % (AAC + resample) |
+| The complete bot, release binary | **3.0 MB** |
+| Resident memory, idle, chat connected | **5.1 MB**, 2 threads |
+| Resident memory, a song playing with OBS listening | ~6 MB (about 11 MB peak while decoding AAC music) |
+| CPU while streaming | ~1.2 % of one core (Opus), ~1.4 % (AAC + resample) |
 | yt-dlp + QuickJS on disk (downloaded, not in the binary) | ~20 MB Windows, ~43 MB Linux, ~39 MB macOS |
+
+For comparison, Twitch-Radio (Electron, a Python core and ffmpeg) installs at
+roughly 500 MB and needs hundreds of MB of RAM while playing.
 
 Build requirements: Rust 1.85+ and `cmake` (libopus is built from the bundled source).
 

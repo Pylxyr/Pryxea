@@ -4,6 +4,9 @@
 //! redirects, chunked bodies.
 #![allow(dead_code)]
 
+pub mod rig;
+pub mod twitch;
+
 use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpListener};
@@ -31,6 +34,48 @@ pub fn pattern(len: usize) -> Vec<u8> {
     (0..len).map(|i| ((i * 7) ^ (i / 251) ^ (i >> 13)) as u8).collect()
 }
 
+/// A request as seen by a scripted route.
+pub struct Req {
+    pub method: String,
+    /// Path including any query string.
+    pub path: String,
+    pub headers: Vec<(String, String)>,
+    pub body: Vec<u8>,
+}
+
+impl Req {
+    pub fn header(&self, name: &str) -> Option<&str> {
+        self.headers.iter().find(|(k, _)| k.eq_ignore_ascii_case(name)).map(|(_, v)| v.as_str())
+    }
+    pub fn json(&self) -> serde_json::Value {
+        serde_json::from_slice(&self.body).unwrap_or(serde_json::Value::Null)
+    }
+    pub fn form(&self) -> Vec<(String, String)> {
+        pryxea::net::url::parse_query(&String::from_utf8_lossy(&self.body))
+    }
+    pub fn form_value(&self, key: &str) -> Option<String> {
+        self.form().into_iter().find(|(k, _)| k == key).map(|(_, v)| v)
+    }
+}
+
+pub struct Resp {
+    pub status: u16,
+    pub headers: Vec<(String, String)>,
+    pub body: Vec<u8>,
+}
+
+impl Resp {
+    pub fn json(status: u16, v: serde_json::Value) -> Resp {
+        Resp { status, headers: vec![("Content-Type".into(), "application/json".into())], body: v.to_string().into_bytes() }
+    }
+    pub fn text(status: u16, t: &str) -> Resp {
+        Resp { status, headers: vec![], body: t.as_bytes().to_vec() }
+    }
+}
+
+type Handler = Arc<dyn Fn(&Req) -> Resp + Send + Sync>;
+type Routes = Arc<Mutex<Vec<(String, Handler)>>>;
+
 trait Io: Read + Write {}
 impl<T: Read + Write> Io for T {}
 
@@ -40,9 +85,15 @@ pub struct Server {
     /// One entry per request: "METHOD /path [Range]".
     pub log: Arc<Mutex<Vec<String>>>,
     pub client_tls: Arc<rustls::ClientConfig>,
+    routes: Routes,
 }
 
 impl Server {
+    /// Scripts a route (exact path, query ignored). Scripted routes win over the built-in ones.
+    pub fn on(&self, method: &str, path: &str, f: impl Fn(&Req) -> Resp + Send + Sync + 'static) {
+        self.routes.lock().unwrap().push((format!("{method} {path}"), Arc::new(f)));
+    }
+
     pub fn url(&self, path: &str) -> String {
         format!("{}://localhost:{}{path}", if self.https { "https" } else { "http" }, self.addr.port())
     }
@@ -61,31 +112,39 @@ fn fixture_path(name: &str) -> String {
     format!("{}/tests/fixtures/{name}", env!("CARGO_MANIFEST_DIR"))
 }
 
+/// Server and client TLS settings for the test CA: clients trust it, the server presents a leaf signed by it.
+pub fn tls_configs() -> (Arc<rustls::ServerConfig>, Arc<rustls::ClientConfig>) {
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    let cert_bytes = std::fs::read(fixture_path("test-cert.pem")).unwrap();
+    let certs: Vec<CertificateDer<'static>> = CertificateDer::pem_slice_iter(&cert_bytes).collect::<Result<_, _>>().unwrap();
+    let key = PrivateKeyDer::from_pem_slice(&std::fs::read(fixture_path("test-key.pem")).unwrap()).unwrap();
+    let server_cfg = Arc::new(rustls::ServerConfig::builder().with_no_client_auth().with_single_cert(certs, key).unwrap());
+    let ca_bytes = std::fs::read(fixture_path("test-ca.pem")).unwrap();
+    let ca: Vec<CertificateDer<'static>> = CertificateDer::pem_slice_iter(&ca_bytes).collect::<Result<_, _>>().unwrap();
+    let mut roots = rustls::RootCertStore::empty();
+    roots.add(ca[0].clone()).unwrap();
+    let client_cfg = Arc::new(rustls::ClientConfig::builder().with_root_certificates(roots).with_no_client_auth());
+    (server_cfg, client_cfg)
+}
+
 pub fn spawn(https: bool) -> Server {
     let _ = rustls::crypto::ring::default_provider().install_default();
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let addr = listener.local_addr().unwrap();
     let log = Arc::new(Mutex::new(Vec::new()));
 
-    let cert_bytes = std::fs::read(fixture_path("test-cert.pem")).unwrap();
-    let certs: Vec<CertificateDer<'static>> = CertificateDer::pem_slice_iter(&cert_bytes).collect::<Result<_, _>>().unwrap();
-    let key = PrivateKeyDer::from_pem_slice(&std::fs::read(fixture_path("test-key.pem")).unwrap()).unwrap();
-    let server_cfg = Arc::new(rustls::ServerConfig::builder().with_no_client_auth().with_single_cert(certs.clone(), key).unwrap());
-    // Clients trust the test CA; the server presents a leaf signed by it.
-    let ca_bytes = std::fs::read(fixture_path("test-ca.pem")).unwrap();
-    let ca: Vec<CertificateDer<'static>> = CertificateDer::pem_slice_iter(&ca_bytes).collect::<Result<_, _>>().unwrap();
-    let mut roots = rustls::RootCertStore::empty();
-    roots.add(ca[0].clone()).unwrap();
-    let client_tls = Arc::new(rustls::ClientConfig::builder().with_root_certificates(roots).with_no_client_auth());
+    let (server_cfg, client_tls) = tls_configs();
 
     let big = Arc::new(pattern(BIG_LEN));
     let small = Arc::new(pattern(SMALL_LEN));
     let counters: Arc<Mutex<HashMap<String, usize>>> = Arc::default();
     let live = Arc::new(AtomicUsize::new(0));
+    let routes: Routes = Arc::default();
+    let thread_routes = routes.clone();
     let thread_log = log.clone();
     thread::spawn(move || {
         for conn in listener.incoming().flatten() {
-            let (log, big, small, counters, cfg, live) = (thread_log.clone(), big.clone(), small.clone(), counters.clone(), server_cfg.clone(), live.clone());
+            let (log, big, small, counters, cfg, live, routes) = (thread_log.clone(), big.clone(), small.clone(), counters.clone(), server_cfg.clone(), live.clone(), thread_routes.clone());
             thread::spawn(move || {
                 live.fetch_add(1, Ordering::Relaxed);
                 let _ = conn.set_read_timeout(Some(std::time::Duration::from_secs(10)));
@@ -95,13 +154,13 @@ pub fn spawn(https: bool) -> Server {
                 } else {
                     Box::new(conn)
                 };
-                let _ = handle(&mut *io, &log, &big, &small, &counters);
+                let _ = handle(&mut *io, &log, &big, &small, &counters, &routes);
                 let _ = io.flush();
                 live.fetch_sub(1, Ordering::Relaxed);
             });
         }
     });
-    Server { addr, https, log, client_tls }
+    Server { addr, https, log, client_tls, routes }
 }
 
 fn read_request(io: &mut dyn Io) -> std::io::Result<(String, String, Vec<(String, String)>, Vec<u8>)> {
@@ -142,8 +201,36 @@ fn parse_range(v: &str, len: usize) -> Option<(usize, usize)> {
     Some((start, end))
 }
 
-fn handle(io: &mut dyn Io, log: &Mutex<Vec<String>>, big: &[u8], small: &[u8], counters: &Mutex<HashMap<String, usize>>) -> std::io::Result<()> {
+fn reason(status: u16) -> &'static str {
+    match status {
+        200 => "OK",
+        202 => "Accepted",
+        204 => "No Content",
+        302 => "Found",
+        400 => "Bad Request",
+        401 => "Unauthorized",
+        403 => "Forbidden",
+        404 => "Not Found",
+        409 => "Conflict",
+        429 => "Too Many Requests",
+        500 => "Internal Server Error",
+        503 => "Service Unavailable",
+        _ => "Status",
+    }
+}
+
+fn handle(io: &mut dyn Io, log: &Mutex<Vec<String>>, big: &[u8], small: &[u8], counters: &Mutex<HashMap<String, usize>>, routes: &Routes) -> std::io::Result<()> {
     let (method, path, headers, body) = read_request(io)?;
+    let scripted = {
+        let key = format!("{method} {}", path.split('?').next().unwrap_or(""));
+        routes.lock().unwrap().iter().rev().find(|(k, _)| *k == key).map(|(_, h)| h.clone())
+    };
+    if let Some(handler) = scripted {
+        log.lock().unwrap().push(format!("{method} {path}"));
+        let resp = handler(&Req { method: method.clone(), path: path.clone(), headers, body });
+        let extra: Vec<(&str, String)> = resp.headers.iter().map(|(k, v)| (k.as_str(), v.clone())).collect();
+        return respond(io, &format!("{} {}", resp.status, reason(resp.status)), &extra, &resp.body);
+    }
     let get = |name: &str| headers.iter().find(|(k, _)| k.eq_ignore_ascii_case(name)).map(|(_, v)| v.clone());
     let range = get("range");
     log.lock().unwrap().push(format!("{method} {path} {}", range.clone().unwrap_or_default()).trim_end().to_string());

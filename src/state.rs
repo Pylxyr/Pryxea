@@ -4,7 +4,7 @@
 //! bumps a version on a `watch` channel so WebSocket clients wake exactly
 //! when something changed.
 
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use serde_json::{Value, json};
@@ -101,6 +101,21 @@ impl Shared {
     pub fn set_now_playing(&self, np: Option<NowPlaying>) {
         self.view().now_playing = np;
         self.bump();
+    }
+
+    /// Updates what is playing without waking WebSocket clients yet; pair with [`Shared::notify_after`].
+    pub fn set_now_playing_quiet(&self, np: Option<NowPlaying>) {
+        self.view().now_playing = np;
+    }
+
+    /// Wakes WebSocket clients after `delay`. OBS plays the stream a few seconds behind real
+    /// time, so the overlay should change when the audio does, not when we switch tracks.
+    pub fn notify_after(self: &Arc<Self>, delay: std::time::Duration) {
+        let me = Arc::clone(self);
+        tokio::spawn(async move {
+            tokio::time::sleep(delay).await;
+            me.bump();
+        });
     }
 
     pub fn set_queue(&self, queue: Vec<QueueItem>) {

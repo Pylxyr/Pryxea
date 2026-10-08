@@ -23,7 +23,7 @@ async fn start() -> Server {
     let port = listener.local_addr().unwrap().port();
     let shared = Arc::new(Shared::new());
     let hub = StreamHub::new();
-    let ctx = Arc::new(Ctx { shared: shared.clone(), hub: hub.clone(), port });
+    let ctx = Arc::new(Ctx::new(shared.clone(), hub.clone(), port));
     tokio::spawn(http::serve(listener, ctx));
     Server { port, shared, hub }
 }

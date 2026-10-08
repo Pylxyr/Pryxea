@@ -25,13 +25,20 @@ struct Cache {
 pub struct JsonStore {
     path: PathBuf,
     cache: Mutex<Cache>,
+    private: bool,
 }
 
 static TMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 impl JsonStore {
     pub fn new(path: impl Into<PathBuf>) -> JsonStore {
-        JsonStore { path: path.into(), cache: Mutex::new(Cache::default()) }
+        JsonStore { path: path.into(), cache: Mutex::new(Cache::default()), private: false }
+    }
+
+    /// For files holding secrets: on unix they are written readable by the owner only.
+    pub fn private(mut self) -> JsonStore {
+        self.private = true;
+        self
     }
 
     pub fn path(&self) -> &Path {
@@ -110,6 +117,11 @@ impl JsonStore {
             let mut file = fs::File::create(&tmp)?;
             file.write_all(&serde_json::to_vec_pretty(&data).map_err(std::io::Error::other)?)?;
             file.sync_all()?;
+            #[cfg(unix)]
+            if self.private {
+                use std::os::unix::fs::PermissionsExt;
+                fs::set_permissions(&tmp, fs::Permissions::from_mode(0o600))?;
+            }
             fs::rename(&tmp, &self.path)
         })();
         if result.is_err() {
@@ -156,6 +168,16 @@ mod tests {
         // A different length guarantees a changed stat key even on coarse timestamps.
         fs::write(&path, r#"{"k": "a-much-longer-value"}"#).unwrap();
         assert_eq!(store.read()["k"], json!("a-much-longer-value"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn private_stores_are_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+        let path = temp_path("private");
+        let store = JsonStore::new(&path).private();
+        store.write(JsonMap::from_iter([("t".to_string(), json!("secret"))])).unwrap();
+        assert_eq!(fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o600);
     }
 
     #[test]
