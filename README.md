@@ -49,6 +49,14 @@ Twitch-Radio, so an existing `.env` carries over. Runtime limits live in
 There is no loudness normalization: every song plays at its own volume, and
 `LOUDNESS_MODE` is ignored (with a warning) if an old `.env` still sets it.
 
+## Releases
+
+Pushing a tag like `v0.2.0` builds five files (Windows x86-64, Linux x86-64 and
+ARM64, macOS ARM64 and Intel), runs the tests on each, and publishes them with a
+`SHA256SUMS` file (`.github/workflows/release.yml`). `ci.yml` runs the tests on
+Linux, Windows and macOS for every push, plus a build on the oldest supported Rust.
+The Windows build links the C runtime statically, so no Visual C++ redistributable is needed.
+
 ## Build
 
 ```sh
@@ -63,18 +71,33 @@ Requires Rust 1.85+.
 1. Register an application at <https://dev.twitch.tv/console/apps>. Add
    `http://localhost:4343/oauth/callback` as an OAuth Redirect URL, and note the
    client ID and secret.
-2. Run `pryxea` once. It creates its home folder with a commented `.env`
-   (`%APPDATA%\Pryxea`, `~/.local/share/pryxea`, or `$PRYXEA_HOME`). Fill in the
-   client ID and secret, plus `TWITCH_BOT_ID` (the bot account's numeric user ID)
-   and `TWITCH_OWNER_ID` (the channel's), then run it again.
-3. Open <http://127.0.0.1:8098/setup> and authorize the bot account. Authorize the
-   broadcaster account too unless the bot is a moderator of the channel.
-4. In OBS add a Media Source (`http://127.0.0.1:8098/stream.opus`) and a Browser
+2. Download the file for your system from the Releases page and run it
+   (`pryxea-windows-x86_64.exe`, `pryxea-linux-x86_64`, `pryxea-macos-aarch64`, ...;
+   on Linux and macOS make it executable first: `chmod +x pryxea-*`). It creates
+   its home folder with a commented `.env` (`%APPDATA%\Pryxea`,
+   `~/.local/share/pryxea`, or `$PRYXEA_HOME`) and opens the setup page in your
+   browser.
+3. Fill in the client ID and secret, plus `TWITCH_BOT_ID` (the bot account's
+   numeric user ID) and `TWITCH_OWNER_ID` (the channel's), then run it again.
+4. On the setup page (<http://127.0.0.1:8098/setup>) authorize the bot account.
+   Authorize the broadcaster account too unless the bot is a moderator of the
+   channel.
+5. In OBS add a Media Source (`http://127.0.0.1:8098/stream.opus`) and a Browser
    Source (`http://127.0.0.1:8098/overlay`).
 
 yt-dlp and a small JavaScript runtime are downloaded automatically the first time
 a song is requested. Existing `.env`, token, queue and settings files from the
 Python Twitch-Radio are picked up as they are.
+
+**No tray icon.** Pryxea is a single small program that idles at a few MB, so it
+has no tray icon. It runs in its console window; close that window, press
+Ctrl+C, or use **Quit Pryxea** on the setup or settings page to stop it.
+
+**Updates.** Once a day it checks the Releases page. If a newer version exists the
+settings page shows an **Update now** button; the download is verified against the
+release's `SHA256SUMS` and swapped in, and nothing restarts until you do.
+`CHECK_FOR_UPDATES=false` turns the check off, and `PRYXEA_UPDATE_REPO=owner/name`
+points it at a different repository.
 
 ## Status
 
@@ -85,7 +108,7 @@ Python Twitch-Radio are picked up as they are.
 | 3 | HTTPS client, seekable range source, yt-dlp lookups, tool installer/updater, radio mix | done |
 | 4 | Twitch (OAuth, chat in and out), queue and player, radio autoplay, setup page, thumbnail relay, `main` wiring | done |
 | 5 | `/settings` page for the request limits and the radio switch | done |
-| 6 | Tray icon, packaging, CI, self-update | next |
+| 6 | Release packaging and CI, update checks, first-run browser opening, Quit button (no tray icon, by design) | done |
 
 ## How a request flows
 

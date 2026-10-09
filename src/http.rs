@@ -27,6 +27,7 @@ use tokio_tungstenite::tungstenite::handshake::derive_accept_key;
 use tokio_tungstenite::tungstenite::protocol::{Message, Role};
 
 use crate::hub::{StreamHub, Subscription};
+use crate::selfupdate::Updater;
 use crate::settings::{self, SettingsPage};
 use crate::setup::Setup;
 use crate::state::Shared;
@@ -50,12 +51,15 @@ pub struct Ctx {
     pub extra_ports: Vec<u16>,
     pub setup: Option<Arc<Setup>>,
     pub settings: Option<Arc<SettingsPage>>,
+    pub updater: Option<Arc<Updater>>,
+    /// Notified when someone presses "Quit Pryxea".
+    pub quit: Arc<tokio::sync::Notify>,
     pub thumbs: Arc<ThumbProxy>,
 }
 
 impl Ctx {
     pub fn new(shared: Arc<Shared>, hub: Arc<StreamHub>, port: u16) -> Ctx {
-        Ctx { shared, hub, port, extra_ports: Vec::new(), setup: None, settings: None, thumbs: Arc::new(ThumbProxy::default()) }
+        Ctx { shared, hub, port, extra_ports: Vec::new(), setup: None, settings: None, updater: None, quit: Arc::new(tokio::sync::Notify::new()), thumbs: Arc::new(ThumbProxy::default()) }
     }
 
     fn ports(&self) -> Vec<u16> {
@@ -142,8 +146,13 @@ async fn route(req: Request<Incoming>, ctx: Arc<Ctx>) -> Result<Response<RespBod
         // 421 Misdirected Request: reached us under a name we don't serve.
         return Ok(plain(StatusCode::MISDIRECTED_REQUEST, "This server only answers on 127.0.0.1 / localhost."));
     }
-    if *req.method() == Method::POST && req.uri().path() == "/settings" {
-        return Ok(settings_post(req, &ctx).await);
+    if *req.method() == Method::POST {
+        match req.uri().path() {
+            "/settings" => return Ok(settings_post(req, &ctx).await),
+            "/update" => return Ok(update_post(&req, &ctx).await),
+            "/quit" => return Ok(quit_post(&req, &ctx)),
+            _ => {}
+        }
     }
     let head_only = match *req.method() {
         Method::GET => false,
@@ -195,6 +204,49 @@ fn protect(mut resp: Response<RespBody>) -> Response<RespBody> {
     h.insert(header::X_FRAME_OPTIONS, HeaderValue::from_static("DENY"));
     h.insert(header::CONTENT_SECURITY_POLICY, HeaderValue::from_static("frame-ancestors 'none'"));
     resp
+}
+
+/// The same guard `/settings` uses: only this server's own pages may press these buttons.
+fn same_origin_post(req: &Request<Incoming>) -> bool {
+    let get = |name: &str| req.headers().get(name).and_then(|v| v.to_str().ok());
+    settings::origin_ok(get("origin"), get("referer"), get("host"), get("sec-fetch-site"))
+}
+
+fn page_html(text: &str) -> String {
+    format!("<!doctype html><meta charset=\"utf-8\"><title>Pryxea</title><body style=\"font:16px system-ui;background:#14141c;color:#e8e8f0;max-width:36rem;margin:3rem auto\"><p>{text}</p><p><a style=\"color:#b58cff\" href=\"/settings\">Back</a></p>")
+}
+
+fn quit_post(req: &Request<Incoming>, ctx: &Ctx) -> Response<RespBody> {
+    if !same_origin_post(req) {
+        crate::warn!("Rejected a quit request from another origin.");
+        return protect(plain(StatusCode::FORBIDDEN, "Origin check failed \u{2014} refusing."));
+    }
+    crate::info!("Quit requested from the web page.");
+    ctx.quit.notify_one();
+    protect(respond(StatusCode::OK, "text/html; charset=utf-8", "<!doctype html><meta charset=\"utf-8\"><title>Pryxea</title><body style=\"font:16px system-ui;background:#14141c;color:#e8e8f0;max-width:36rem;margin:3rem auto\"><p>Pryxea is shutting down. You can close this tab.</p>"))
+}
+
+async fn update_post(req: &Request<Incoming>, ctx: &Ctx) -> Response<RespBody> {
+    if !same_origin_post(req) {
+        crate::warn!("Rejected an update request from another origin.");
+        return protect(plain(StatusCode::FORBIDDEN, "Origin check failed \u{2014} refusing."));
+    }
+    let Some(updater) = ctx.updater.clone() else { return plain(StatusCode::NOT_FOUND, "Not found.") };
+    let result = tokio::task::spawn_blocking(move || updater.install_now()).await.unwrap_or_else(|_| Err(crate::tools::ToolError::Io("the updater crashed".into())));
+    let (status, message) = match result {
+        Ok(_) => (StatusCode::OK, None),
+        Err(e) => (StatusCode::BAD_GATEWAY, Some(format!("Update failed: {e}"))),
+    };
+    let html = match (&ctx.settings, message) {
+        (Some(page), Some(m)) => page.render(Some((&m, true))),
+        (Some(page), None) => page.render(None),
+        (None, m) => page_html(&settings_text(m)),
+    };
+    protect(respond(status, "text/html; charset=utf-8", html))
+}
+
+fn settings_text(m: Option<String>) -> String {
+    crate::setup::esc(&m.unwrap_or_else(|| "Updated. Close and reopen Pryxea to use the new version.".into()))
 }
 
 async fn settings_post(req: Request<Incoming>, ctx: &Ctx) -> Response<RespBody> {

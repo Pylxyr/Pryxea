@@ -43,6 +43,10 @@ pub struct Settings {
     pub port: u16,
     /// Where Twitch sends the browser after authorizing; must match the Twitch application settings.
     pub redirect_uri: String,
+    /// `owner/name` of the GitHub repository Pryxea's own releases come from.
+    pub update_repo: String,
+    pub check_for_updates: bool,
+    pub open_browser: bool,
     pub twitch_urls: TwitchUrls,
     pub audio_bitrate_kbps: u32,
     pub pause_when_no_listeners: bool,
@@ -219,6 +223,18 @@ pub fn load(get: &dyn Fn(&str) -> Option<String>, home: &Path, data: &Path, logs
             }
         }
     };
+    let update_repo = {
+        let raw = r.text("PRYXEA_UPDATE_REPO");
+        let plain = |part: &str| !part.is_empty() && part.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'));
+        match raw.split_once('/') {
+            _ if raw.is_empty() => crate::selfupdate::DEFAULT_REPO.to_string(),
+            Some((owner, name)) if plain(owner) && plain(name) => raw,
+            _ => {
+                r.warnings.push(format!("PRYXEA_UPDATE_REPO={raw:?} is not of the form owner/name - using the default."));
+                crate::selfupdate::DEFAULT_REPO.to_string()
+            }
+        }
+    };
     let twitch_urls = {
         let url = |name: &str| Some(r.text(name)).filter(|v| !v.is_empty());
         TwitchUrls { id: url("TWITCH_ID_URL"), api: url("TWITCH_API_URL"), eventsub: url("TWITCH_EVENTSUB_URL") }
@@ -230,6 +246,9 @@ pub fn load(get: &dyn Fn(&str) -> Option<String>, home: &Path, data: &Path, logs
         owner_id,
         port,
         redirect_uri,
+        update_repo,
+        check_for_updates: r.bool("CHECK_FOR_UPDATES", true),
+        open_browser: r.bool("OPEN_BROWSER", true),
         twitch_urls,
         audio_bitrate_kbps: r.clamped("AUDIO_BITRATE_KBPS", 160, 64, 256) as u32,
         pause_when_no_listeners: r.bool("PAUSE_QUEUE_WHEN_NO_LISTENERS", false),
@@ -311,6 +330,23 @@ mod tests {
             pairs.push(("TWITCH_REDIRECT_URI", bad));
             let l = load_with(&pairs);
             assert_eq!(l.settings.redirect_uri, "http://localhost:4343/oauth/callback", "{bad}");
+            assert_eq!(l.warnings.len(), 1, "{bad}");
+        }
+    }
+
+    #[test]
+    fn update_and_browser_settings_have_safe_defaults() {
+        let l = load_with(&CREDS);
+        assert_eq!((l.settings.update_repo.as_str(), l.settings.check_for_updates, l.settings.open_browser), ("Pylxyr/Pryxea", true, true));
+        let mut pairs = CREDS.to_vec();
+        pairs.extend([("PRYXEA_UPDATE_REPO", "someone/else.repo"), ("CHECK_FOR_UPDATES", "off"), ("OPEN_BROWSER", "no")]);
+        let l = load_with(&pairs);
+        assert_eq!((l.settings.update_repo.as_str(), l.settings.check_for_updates, l.settings.open_browser), ("someone/else.repo", false, false));
+        for bad in ["noslash", "a/b/c", "evil.example/../x y", "/", "a/"] {
+            let mut pairs = CREDS.to_vec();
+            pairs.push(("PRYXEA_UPDATE_REPO", bad));
+            let l = load_with(&pairs);
+            assert_eq!(l.settings.update_repo, "Pylxyr/Pryxea", "{bad}");
             assert_eq!(l.warnings.len(), 1, "{bad}");
         }
     }

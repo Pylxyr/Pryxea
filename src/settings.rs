@@ -11,6 +11,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use crate::net::url::Url;
+use crate::selfupdate::Updater;
 use crate::setup::esc;
 use crate::state::Shared;
 use crate::store::JsonStore;
@@ -42,6 +43,7 @@ pub struct SettingsPage {
     /// Label / value rows for the "Endpoints" table.
     info: Vec<(String, String)>,
     started: Instant,
+    updater: Option<Arc<Updater>>,
 }
 
 /// Replaces every `${name}` in `template` in one pass, so inserted values are never rescanned
@@ -96,7 +98,13 @@ fn truthy(v: &str) -> bool {
 
 impl SettingsPage {
     pub fn new(tunables: Arc<JsonStore>, toggles: Arc<JsonStore>, shared: Arc<Shared>, info: Vec<(String, String)>) -> SettingsPage {
-        SettingsPage { tunables, toggles, shared, info, started: Instant::now() }
+        SettingsPage { tunables, toggles, shared, info, started: Instant::now(), updater: None }
+    }
+
+    /// Shows update notices (and the "Update now" button) at the top of the page.
+    pub fn with_updater(mut self, updater: Arc<Updater>) -> SettingsPage {
+        self.updater = Some(updater);
+        self
     }
 
     fn tunable_rows(&self, t: &Tunables) -> String {
@@ -149,6 +157,7 @@ impl SettingsPage {
         let t = Tunables::from_map(&self.tunables.read());
         let f = Toggles::from_map(&self.toggles.read());
         let banner = message.map(|(text, error)| format!("<div class=\"banner {}\" role=\"status\">{}</div>", if error { "banner-error" } else { "banner-ok" }, esc(text))).unwrap_or_default();
+        let banner = format!("{}{banner}", self.updater.as_ref().map(|u| u.banner_html()).unwrap_or_default());
         let info: String = self.info.iter().map(|(k, v)| format!("<tr><td>{}</td><td><code>{}</code></td></tr>", esc(k), esc(v))).collect();
         let marker = format!("{FORM_MARKER}");
         fill(

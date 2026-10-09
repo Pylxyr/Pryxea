@@ -14,6 +14,7 @@ use pryxea::net::http::Client;
 use pryxea::net::url::Url;
 use pryxea::paths::Dirs;
 use pryxea::settings::SettingsPage;
+use pryxea::selfupdate::{self, Repo, Updater};
 use pryxea::setup::Setup;
 use pryxea::state::Shared;
 use pryxea::station::{Deps, HttpOpener, ResolverLookup, Station};
@@ -25,7 +26,7 @@ use pryxea::twitch::eventsub::{self, Link};
 use pryxea::twitch::helix::Helix;
 use pryxea::twitch::Endpoints;
 use pryxea::ytdlp::Resolver;
-use pryxea::{error, info, warn};
+use pryxea::{browser, error, info, warn};
 use tokio::sync::{mpsc, watch};
 
 const ENV_TEMPLATE: &str = include_str!("../.env.example");
@@ -156,6 +157,14 @@ async fn run() -> ExitCode {
     // ---- tools: yt-dlp and its JavaScript runtime are downloaded and kept current in the background
     tokio::spawn(keep_tools_current(http_client.clone(), bin_dir, JsonStore::new(dirs.data.join("tools.json")), resolver, settings.ytdlp.path.is_some(), settings.ytdlp.js_runtime_path.is_some()));
 
+    // ---- Pryxea's own updates: look daily, install only when asked
+    let exe = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("pryxea"));
+    selfupdate::clean_up_old(&exe);
+    let updater = Arc::new(Updater::new(http_client.clone(), Repo::github(&settings.update_repo), exe, selfupdate::CURRENT_VERSION));
+    if settings.check_for_updates {
+        tokio::spawn(check_for_updates_daily(updater.clone()));
+    }
+
     // ---- the web server (OBS, overlay, setup page)
     let info = vec![
         ("OBS Media Source".to_string(), format!("http://127.0.0.1:{}/stream.opus", settings.port)),
@@ -165,14 +174,22 @@ async fn run() -> ExitCode {
         ("Version".to_string(), env!("CARGO_PKG_VERSION").to_string()),
     ];
     let mut ctx = Ctx::new(shared.clone(), hub, settings.port);
-    ctx.settings = Some(Arc::new(SettingsPage::new(tunables, toggles, shared, info)));
+    ctx.settings = Some(Arc::new(SettingsPage::new(tunables, toggles, shared, info).with_updater(updater.clone())));
+    ctx.updater = Some(updater.clone());
     ctx.extra_ports = vec![redirect_port];
-    ctx.setup = Some(Arc::new(Setup::new(auth, settings.redirect_uri.clone(), settings.bot_id.clone(), settings.owner_id.clone(), settings.port, link_rx, loaded.problems.clone())));
+    ctx.setup = Some(Arc::new(Setup::new(auth, settings.redirect_uri.clone(), settings.bot_id.clone(), settings.owner_id.clone(), settings.port, link_rx, loaded.problems.clone()).with_updater(updater)));
     let ctx = Arc::new(ctx);
     info!("OBS Media Source   -> http://127.0.0.1:{}/stream.opus", settings.port);
     info!("OBS Browser Source -> http://127.0.0.1:{}/overlay", settings.port);
     info!("Setup page         -> http://127.0.0.1:{}/setup", settings.port);
 
+    // First run (or anything still to set up): take the user straight to the setup page.
+    let needs_setup = !loaded.twitch_ready() || auth_missing_token(&ctx);
+    if settings.open_browser && needs_setup && !browser::open(&format!("http://127.0.0.1:{}/setup", settings.port)) {
+        info!("Open http://127.0.0.1:{}/setup in your browser to finish setting up.", settings.port);
+    }
+
+    let quit = ctx.quit.clone();
     let oauth_server = async {
         match oauth_listener {
             Some(l) => http::serve(l, ctx.clone()).await,
@@ -183,8 +200,29 @@ async fn run() -> ExitCode {
         _ = http::serve(listener, ctx.clone()) => {}
         _ = oauth_server => {}
         _ = shutdown_signal() => info!("Shutting down."),
+        _ = quit.notified() => info!("Shutting down (asked from the web page)."),
     }
     ExitCode::SUCCESS
+}
+
+/// True when the bot account has no saved token yet (the setup page can fix that).
+fn auth_missing_token(ctx: &Ctx) -> bool {
+    ctx.setup.as_ref().is_some_and(|s| s.needs_authorization())
+}
+
+/// Checks for a newer Pryxea a minute after start and then once a day.
+async fn check_for_updates_daily(updater: Arc<Updater>) {
+    tokio::time::sleep(Duration::from_secs(60)).await;
+    loop {
+        let u = updater.clone();
+        match tokio::task::spawn_blocking(move || u.check_now()).await {
+            Ok(Ok(Some(v))) => info!("Pryxea {v} is available: open the settings page to install it."),
+            Ok(Ok(None)) => {}
+            Ok(Err(e)) => info!("Couldn't check for a newer Pryxea ({e})."),
+            Err(_) => warn!("the update check crashed"),
+        }
+        tokio::time::sleep(Duration::from_secs(24 * 60 * 60)).await;
+    }
 }
 
 /// Installs yt-dlp (and a small JavaScript runtime) on first run, then refreshes yt-dlp daily.

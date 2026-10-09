@@ -170,3 +170,90 @@ async fn a_saved_limit_takes_effect_immediately_in_the_running_station() {
     assert!(!r.station.radio_status());
     tokio::time::sleep(Duration::from_millis(10)).await;
 }
+
+// ------------------------------------------------------------ quit and update
+
+use pryxea::net::http::Client;
+use pryxea::selfupdate::{Repo, Updater};
+
+async fn start_with_controls(tag: &str) -> (App, Arc<tokio::sync::Notify>, Arc<Updater>, std::path::PathBuf) {
+    let dir = std::env::temp_dir().join(format!("pryxea-controls-{tag}-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let exe = dir.join(if cfg!(windows) { "pryxea.exe" } else { "pryxea" });
+    std::fs::write(&exe, b"OLD PROGRAM").unwrap();
+    let release = common::spawn(false);
+    let repo = Repo { download_base: release.url("/rel"), latest_url: release.url("/rel/latest") };
+    let updater = Arc::new(Updater::new(Arc::new(Client::new()), repo, exe.clone(), "0.1.0"));
+    let (tunables, toggles) = (Arc::new(JsonStore::new(dir.join("tunables.json"))), Arc::new(JsonStore::new(dir.join("toggles.json"))));
+    let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let shared = Arc::new(Shared::new());
+    let mut ctx = Ctx::new(shared.clone(), StreamHub::new(), port);
+    ctx.settings = Some(Arc::new(SettingsPage::new(tunables.clone(), toggles.clone(), shared, vec![]).with_updater(updater.clone())));
+    ctx.updater = Some(updater.clone());
+    let quit = ctx.quit.clone();
+    tokio::spawn(http::serve(listener, Arc::new(ctx)));
+    std::mem::forget(release); // keep the fake release server alive for the test's duration
+    (App { port, tunables, toggles }, quit, updater, exe)
+}
+
+#[tokio::test]
+async fn the_quit_button_works_from_the_page_and_from_nowhere_else() {
+    let (app, quit, _, _) = start_with_controls("quit").await;
+    let (head, _) = request(app.port, "POST", "/quit", &[("Origin", "https://evil.example")], Some("")).await;
+    assert_eq!(status(&head), 403, "{head}");
+    let (head, _) = request(app.port, "POST", "/quit", &[("Sec-Fetch-Site", "cross-site")], Some("")).await;
+    assert_eq!(status(&head), 403, "{head}");
+    assert!(tokio::time::timeout(Duration::from_millis(200), quit.notified()).await.is_err(), "a refused request must not shut anything down");
+    let (head, body) = request(app.port, "GET", "/quit", &[], None).await;
+    assert_eq!(status(&head), 404, "a plain link (or an <img> tag on another site) can never quit: {head}");
+    assert!(!body.contains("shutting down"));
+
+    let origin = format!("http://127.0.0.1:{}", app.port);
+    let waiting = tokio::spawn({
+        let quit = quit.clone();
+        async move { quit.notified().await }
+    });
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    let (head, body) = request(app.port, "POST", "/quit", &[("Origin", &origin), ("Sec-Fetch-Site", "same-origin")], Some("")).await;
+    assert_eq!(status(&head), 200, "{head}");
+    assert!(body.contains("shutting down"));
+    tokio::time::timeout(Duration::from_secs(2), waiting).await.expect("main must be told to quit").unwrap();
+}
+
+#[tokio::test]
+async fn the_update_button_installs_a_verified_release_and_the_page_says_to_restart() {
+    let (app, _quit, updater, exe) = start_with_controls("update").await;
+    // Before anything is known, the page has no update banner and the button does nothing useful.
+    let (_, page) = request(app.port, "GET", "/settings", &[], None).await;
+    assert!(!page.contains("Update now"));
+    let (head, body) = request(app.port, "POST", "/update", &[], Some("")).await;
+    assert_eq!(status(&head), 502, "{head}");
+    assert!(body.contains("Update failed") && body.contains("banner-error"), "{body}");
+
+    // A check finds a newer release: the banner appears with the button.
+    let u = updater.clone();
+    assert_eq!(tokio::task::spawn_blocking(move || u.check_now()).await.unwrap().unwrap().as_deref(), Some("9.9.9"));
+    let (_, page) = request(app.port, "GET", "/settings", &[], None).await;
+    assert!(page.contains("Pryxea 9.9.9 is available") && page.contains("action=\"/update\""), "{page}");
+
+    // Another website can't press the button.
+    let (head, _) = request(app.port, "POST", "/update", &[("Origin", "https://evil.example")], Some("")).await;
+    assert_eq!(status(&head), 403);
+    assert_eq!(std::fs::read(&exe).unwrap(), b"OLD PROGRAM");
+
+    // The page can.
+    let origin = format!("http://127.0.0.1:{}", app.port);
+    let (head, body) = request(app.port, "POST", "/update", &[("Origin", &origin)], Some("")).await;
+    assert_eq!(status(&head), 200, "{head}\n{body}");
+    assert!(body.contains("Updated to Pryxea 9.9.9") && body.contains("Close and reopen"), "{body}");
+    assert_eq!(std::fs::read(&exe).unwrap(), common::TOOL_PAYLOAD);
+}
+
+#[tokio::test]
+async fn without_an_updater_the_update_route_does_not_exist() {
+    let app = start("no-updater").await;
+    let (head, _) = request(app.port, "POST", "/update", &[], Some("")).await;
+    assert_eq!(status(&head), 404, "{head}");
+}

@@ -111,7 +111,7 @@ fn hex(bytes: &[u8]) -> String {
 }
 
 /// Streams `url` to `dest` (via a temporary file), refusing it unless its SHA-256 matches.
-fn download_verified(client: &Client, url: &str, expected_sha256: &str, dest: &Path) -> Result<(), ToolError> {
+pub(crate) fn download_verified(client: &Client, url: &str, expected_sha256: &str, dest: &Path) -> Result<(), ToolError> {
     let io = |e: std::io::Error| ToolError::Io(format!("{}: {e}", dest.display()));
     let dir = dest.parent().unwrap_or_else(|| Path::new("."));
     std::fs::create_dir_all(dir).map_err(io)?;
@@ -150,15 +150,16 @@ fn download_verified(client: &Client, url: &str, expected_sha256: &str, dest: &P
     result
 }
 
-fn expected_ytdlp_sha(client: &Client, release: &Release, asset: &str) -> Result<String, ToolError> {
-    let url = format!("{}/SHA2-256SUMS", release.download_base);
+/// The published SHA-256 of `asset`, from the checksum file `sums_name` next to it.
+pub(crate) fn expected_sha(client: &Client, download_base: &str, sums_name: &str, asset: &str) -> Result<String, ToolError> {
+    let url = format!("{download_base}/{sums_name}");
     let body = client.send(&Request::get(&url)).and_then(|r| r.error_for_status()).and_then(|r| r.bytes(256 * 1024)).map_err(|e| ToolError::Net(format!("{url}: {e}")))?;
     parse_sums(&String::from_utf8_lossy(&body), asset).ok_or_else(|| ToolError::Verify(format!("{asset} is not listed in {url}")))
 }
 
 fn install_ytdlp(client: &Client, release: &Release, bin_dir: &Path) -> Result<PathBuf, ToolError> {
     let asset = this_platform()?.ytdlp;
-    let sha = expected_ytdlp_sha(client, release, asset)?;
+    let sha = expected_sha(client, &release.download_base, "SHA2-256SUMS", asset)?;
     let dest = ytdlp_path(bin_dir);
     download_verified(client, &format!("{}/{asset}", release.download_base), &sha, &dest)?;
     Ok(dest)

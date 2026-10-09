@@ -5,6 +5,7 @@
 //! bundled browser, and no child processes while the stream is idle.
 
 pub mod audio;
+pub mod browser;
 pub mod bot;
 pub mod commands;
 pub mod config;
@@ -14,6 +15,7 @@ pub mod hub;
 pub mod logging;
 pub mod net;
 pub mod paths;
+pub mod selfupdate;
 pub mod settings;
 pub mod setup;
 pub mod state;

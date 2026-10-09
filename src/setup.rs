@@ -9,6 +9,7 @@ use std::time::{Duration, Instant};
 use tokio::sync::watch;
 
 use crate::net::url::{parse_query, percent_encode};
+use crate::selfupdate::Updater;
 use crate::twitch::auth::Auth;
 use crate::twitch::eventsub::Link;
 use crate::twitch::{BOT_SCOPES, BROADCASTER_SCOPES};
@@ -33,6 +34,7 @@ pub struct Setup {
     /// Configuration problems found at start-up (shown at the top of the page).
     problems: Vec<String>,
     states: Mutex<HashMap<String, (Instant, Role)>>,
+    updater: Option<Arc<Updater>>,
 }
 
 pub fn esc(s: &str) -> String {
@@ -66,11 +68,16 @@ fn page(title: &str, body: &str) -> String {
 
 impl Setup {
     pub fn new(auth: Option<Arc<Auth>>, redirect_uri: String, bot_id: String, owner_id: String, main_port: u16, link: watch::Receiver<Link>, problems: Vec<String>) -> Setup {
-        Setup { auth, redirect_uri, bot_id, owner_id, main_port, link, problems, states: Mutex::default() }
+        Setup { auth, redirect_uri, bot_id, owner_id, main_port, link, problems, states: Mutex::default(), updater: None }
+    }
+
+    pub fn with_updater(mut self, updater: Arc<Updater>) -> Setup {
+        self.updater = Some(updater);
+        self
     }
 
     pub fn status_page(&self) -> String {
-        let mut body = String::from("<h1>Pryxea setup</h1>");
+        let mut body = format!("<h1>Pryxea setup</h1>{}", self.updater.as_ref().map(|u| u.banner_html()).unwrap_or_default());
         if !self.problems.is_empty() {
             body.push_str("<p class=\"bad\">Twitch isn't configured yet. Fix these in the <code>.env</code> file, then restart:</p><ul>");
             for p in &self.problems {
@@ -105,6 +112,7 @@ impl Setup {
             body.push_str(&format!("<p class=\"dim\">Your Twitch application must list <code>{}</code> as an OAuth Redirect URL (dev.twitch.tv/console).</p>", esc(&self.redirect_uri)));
         }
         body.push_str("<p><a href=\"/settings\">Request limits and radio settings</a></p>");
+        body.push_str("<form method=\"post\" action=\"/quit\"><button type=\"submit\">Quit Pryxea</button> <span class=\"dim\">stops the bot and the stream</span></form>");
         body.push_str(&format!(
             "<h2>OBS</h2><p>Media Source: <code>http://127.0.0.1:{p}/stream.opus</code><br>Browser Source: <code>http://127.0.0.1:{p}/overlay</code></p>",
             p = self.main_port
@@ -166,6 +174,14 @@ impl Setup {
         }
         crate::info!("Authorized the {label} account {} ({}).", token.login, token.user_id);
         (200, page("Pryxea", &format!("<h1 class=\"ok\">\u{2713} Authorized {}</h1><p>The {label} account is set up. You can close this tab.</p><p><a class=\"btn\" href=\"/setup\">Back to setup</a></p>", esc(&token.login))))
+    }
+
+    /// True while the bot account still has to be authorized (or Twitch isn't configured at all).
+    pub fn needs_authorization(&self) -> bool {
+        match &self.auth {
+            None => true,
+            Some(auth) => auth.saved(&self.bot_id).is_none(),
+        }
     }
 
     /// For tests: how many authorizations are in flight.

@@ -293,6 +293,15 @@ fn handle(io: &mut dyn Io, log: &Mutex<Vec<String>>, big: &[u8], small: &[u8], c
             let text: String = TOOL_ASSETS.iter().map(|a| format!("{hash}  {a}\n")).collect();
             respond(io, "200 OK", &[], text.as_bytes())
         }
+        "/rel/latest" | "/rel-bad/latest" => respond(io, "302 Found", &[("Location", "/rel/tag/v9.9.9".to_string())], b""),
+        "/rel/tag/v9.9.9" => respond(io, "200 OK", &[], b"release page"),
+        "/rel/SHA256SUMS" | "/rel-bad/SHA256SUMS" => {
+            let hash = if path.starts_with("/rel-bad/") { "f".repeat(64) } else { tool_sha() };
+            let names = ["pryxea-windows-x86_64.exe", "pryxea-linux-x86_64", "pryxea-linux-aarch64", "pryxea-macos-aarch64", "pryxea-macos-x86_64"];
+            let text: String = names.iter().map(|a| format!("{hash}  {a}\n")).collect();
+            respond(io, "200 OK", &[], text.as_bytes())
+        }
+        p if p.starts_with("/rel/") || p.starts_with("/rel-bad/") => respond(io, "200 OK", &[], TOOL_PAYLOAD),
         p if p.starts_with("/tools/") || p.starts_with("/qjs/") => respond(io, "200 OK", &[], TOOL_PAYLOAD),
         "/redir" => respond(io, "302 Found", &[("Location", "/small".to_string())], b""),
         "/redir-loop" => respond(io, "302 Found", &[("Location", "/redir-loop".to_string())], b""),
