@@ -1,0 +1,66 @@
+name: Release
+
+# Push a tag like v0.2.0 to publish a release. The file names below are what the
+# built-in updater downloads (see src/selfupdate.rs: asset_name) - keep them in step.
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: Build ${{ matrix.asset }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          - { runner: windows-latest, target: x86_64-pc-windows-msvc,   asset: pryxea-windows-x86_64.exe, bin: pryxea.exe }
+          - { runner: ubuntu-22.04,   target: x86_64-unknown-linux-gnu, asset: pryxea-linux-x86_64,       bin: pryxea }
+          - { runner: ubuntu-22.04-arm, target: aarch64-unknown-linux-gnu, asset: pryxea-linux-aarch64,   bin: pryxea }
+          - { runner: macos-14,       target: aarch64-apple-darwin,     asset: pryxea-macos-aarch64,      bin: pryxea }
+          - { runner: macos-14,       target: x86_64-apple-darwin,      asset: pryxea-macos-x86_64,       bin: pryxea }
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+      - name: Test
+        # (the Intel macOS build is cross-compiled on an Apple-silicon runner and can't run its own tests)
+        if: matrix.target != 'x86_64-apple-darwin'
+        run: cargo test --locked --target ${{ matrix.target }}
+      - name: Build
+        run: cargo build --release --locked --target ${{ matrix.target }}
+      - name: Name the file for the updater
+        shell: bash
+        run: cp "target/${{ matrix.target }}/release/${{ matrix.bin }}" "${{ matrix.asset }}"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.asset }}
+          path: ${{ matrix.asset }}
+
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Checksums
+        working-directory: dist
+        run: |
+          sha256sum pryxea-* > SHA256SUMS
+          cat SHA256SUMS
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
+          generate_release_notes: true
